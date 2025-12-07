@@ -99,117 +99,71 @@ class VisionTSTeacher(nn.Module):
             pooled = x_enc.mean(dim=1)  # [batch, n_vars]
             embedding = self.fallback_proj(pooled)  # [batch, hidden_size]
             return embedding
-
-
-class TimeSeriesEncoder(nn.Module):
-    """
-    Wrapper for any TS model to extract intermediate encodings
-    """
-    
-    def __init__(self, base_model, d_model):
-        super().__init__()
-        self.base_model = base_model
-        self.d_model = d_model
-        self.encoding = None
-        self.n_vars = None
-        self._register_hooks()
-    
-    def _register_hooks(self):
-        """Register hooks to extract encodings from base model"""
-        
-        # For PatchTST - extract after encoder
-        if hasattr(self.base_model, 'encoder'):
-            def hook_fn(module, input, output):
-                if isinstance(output, tuple):
-                    enc_out = output[0]
-                else:
-                    enc_out = output
-                # enc_out shape: [batch * nvars, seq, d_model] for PatchTST
-                # Global average pooling over sequence dimension
-                self.encoding = enc_out.mean(dim=1)  # [batch * nvars, d_model]
             
-            self.base_model.encoder.register_forward_hook(hook_fn)
-            print("✅ Hook registered for encoder")
-        
-        # For models with nested encoder
-        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'encoder'):
-            def hook_fn(module, input, output):
-                if isinstance(output, tuple):
-                    enc_out = output[0]
-                else:
-                    enc_out = output
-                self.encoding = enc_out.mean(dim=1)
-            
-            self.base_model.model.encoder.register_forward_hook(hook_fn)
-            print("✅ Hook registered for nested encoder")
-        else:
-            print("⚠️ No encoder found, will use alternative method")
-    
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        """
-        Forward and extract encoding
-        Returns: encoding [batch_size, d_model * n_vars] or pooled [batch_size, d_model]
-        """
-        # Store n_vars for reshaping
-        batch_size = x_enc.shape[0]
-        self.n_vars = x_enc.shape[2]  # [batch, seq, n_vars]
-        
-        # Run forward pass (triggers hooks)
-        _ = self.base_model(x_enc, x_mark_enc, x_dec, x_mark_dec)
-        
-        if self.encoding is None:
-            # Fallback if hook didn't work
-            print("⚠️ Hook didn't capture encoding, using fallback")
-            self.encoding = x_enc.mean(dim=1)  # [batch, n_vars]
-            if self.encoding.shape[-1] != self.d_model:
-                if not hasattr(self, 'fallback_proj'):
-                    self.fallback_proj = nn.Linear(self.encoding.shape[-1], self.d_model).to(x_enc.device)
-                self.encoding = self.fallback_proj(self.encoding)
-            return self.encoding
-        
-        # For PatchTST: encoding is [batch * nvars, d_model]
-        # Reshape to [batch, nvars, d_model] then pool or flatten
-        if self.encoding.shape[0] == batch_size * self.n_vars:
-            # Reshape: [batch * nvars, d_model] -> [batch, nvars, d_model]
-            encoding_reshaped = self.encoding.view(batch_size, self.n_vars, self.d_model)
-            # Pool across variables: [batch, nvars, d_model] -> [batch, d_model]
-            final_encoding = encoding_reshaped.mean(dim=1)
-        else:
-            # Already in correct shape [batch, d_model]
-            final_encoding = self.encoding
-        
-        return final_encoding
-
 
 class JEPAPredictor(nn.Module):
     """
     JEPA predictor: maps student encoding to teacher encoding space
+    Supports both 4D (PatchTST) and 1D (DLinear, iTransformer, etc.) inputs
     """
     
-    def __init__(self, student_dim, teacher_dim, hidden_dim=512, num_layers=2):
+    def __init__(self, student_dim, teacher_dim, hidden_dim=512, input_shape=None):
+        """
+        Args:
+            student_dim: d_model dimension (used for 1D input)
+            teacher_dim: teacher embedding dimension (e.g., 768)
+            hidden_dim: hidden layer dimension for MLP
+            input_shape: tuple (n_vars, d_model, patch_num) for 4D input
+                        - If provided: expects 4D input [batch, n_vars, d_model, patch_num]
+                        - If None: expects 1D input [batch, student_dim]
+        
+        Examples:
+            # For PatchTST (4D):
+            predictor = JEPAPredictor(512, 768, 512, input_shape=(7, 512, 12))
+            
+            # For DLinear/iTransformer (1D):
+            predictor = JEPAPredictor(512, 768, 512, input_shape=None)
+        """
         super().__init__()
         
-        layers = []
-        current_dim = student_dim
+        self.input_shape = input_shape
         
-        for i in range(num_layers - 1):
-            layers.extend([
-                nn.Linear(current_dim, hidden_dim),
+        if input_shape is not None:
+            # For 4D input (PatchTST, CNN-based models)
+            # Input: [batch, n_vars, d_model, patch_num]
+            n_vars, d_model, patch_num = input_shape
+            flatten_dim = n_vars * d_model * patch_num
+            
+            self.predictor = nn.Sequential(
+                nn.Flatten(start_dim=1),  # Flatten all spatial dims
+                nn.Linear(flatten_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
-                nn.Dropout(0.1)
-            ])
-            current_dim = hidden_dim
-        
-        # Final layer to teacher dimension
-        layers.append(nn.Linear(current_dim, teacher_dim))
-        
-        self.predictor = nn.Sequential(*layers)
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, teacher_dim)
+            )
+        else:
+            # For 1D input (DLinear, iTransformer, Transformer, etc.)
+            # Input: [batch, student_dim]
+            self.predictor = nn.Sequential(
+                nn.Linear(student_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, teacher_dim)
+            )
     
     def forward(self, student_encoding):
         """
-        student_encoding: [batch_size, student_dim]
-        Returns: [batch_size, teacher_dim]
+        Forward pass
+        
+        Args:
+            student_encoding: 
+                - 4D: [batch_size, n_vars, d_model, patch_num] (if input_shape was provided)
+                - 1D: [batch_size, student_dim] (if input_shape was None)
+        
+        Returns:
+            [batch_size, teacher_dim] - predicted teacher encoding
         """
         return self.predictor(student_encoding)
 
@@ -323,16 +277,18 @@ class Model(nn.Module):
         self.student_dim = configs.d_model
         print(f"✅ Student dimension: {self.student_dim}")
 
-        
-        
+        patch_len = 16
+        stride = 8
+        patch_num = int((configs.seq_len - patch_len) / stride + 2)
+
         # JEPA Predictor (trainable)
         print(f"\n🔗 Building JEPA predictor...")
         self.predictor = JEPAPredictor(
-            student_dim=self.student_dim,
-            teacher_dim=self.teacher_dim,
-            hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
-            num_layers=getattr(configs, 'jepa_num_layers', 2)
-        )
+                student_dim=configs.d_model,
+                teacher_dim=self.teacher_dim,
+                hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
+                input_shape=(configs.enc_in, configs.d_model, patch_num)  # 4D
+            )
         print(f"✅ JEPA predictor: {self.student_dim} -> {self.teacher_dim}")
         
         # Prediction head for forecasting task
