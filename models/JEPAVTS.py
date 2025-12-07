@@ -99,7 +99,7 @@ class VisionTSTeacher(nn.Module):
             pooled = x_enc.mean(dim=1)  # [batch, n_vars]
             embedding = self.fallback_proj(pooled)  # [batch, hidden_size]
             return embedding
-            
+
 
 class JEPAPredictor(nn.Module):
     """
@@ -273,13 +273,20 @@ class Model(nn.Module):
             self.encoder_fusion = EncodingFusion(d_model=configs.d_model,
                                             fusion_type=getattr(configs, 'fusion_type', 'mlp')  # mlp, weighted, or add
                                         )
-        # self.student = TimeSeriesEncoder(self.student_base, configs.d_model)
         self.student_dim = configs.d_model
         print(f"✅ Student dimension: {self.student_dim}")
 
-        patch_len = 16
-        stride = 8
-        patch_num = int((configs.seq_len - patch_len) / stride + 2)
+        # Calculate patch_num dynamically based on student model type
+        student_model_name = getattr(configs, 'student_model', 'PatchTST')
+
+        if student_model_name == 'PatchTST' and hasattr(self.student, 'patch_embedding'):
+            # Get values from PatchTST
+            patch_len = self.student.patch_embedding.patch_len
+            stride = self.student.patch_embedding.stride
+            patch_num = int((configs.seq_len - patch_len) / stride + 2)
+        else:
+            # For non-patch models (DLinear, etc.), use 1D input
+            patch_num = None
 
         # JEPA Predictor (trainable)
         print(f"\n🔗 Building JEPA predictor...")
