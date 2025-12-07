@@ -1,0 +1,292 @@
+from data_provider.data_factory import data_provider
+from exp.exp_basic import Exp_Basic
+from utils.tools import EarlyStopping, adjust_learning_rate, visual
+from utils.metrics import metric
+import torch
+import torch.nn as nn
+from torch import optim
+import os
+import time
+import warnings
+import numpy as np
+
+warnings.filterwarnings('ignore')
+
+
+class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
+    def __init__(self, args):
+        super(Exp_JEPA_VTS_Long_Term_Forecast, self).__init__(args)
+    
+    def _build_model(self):
+        # Import JEPA-VTS model
+        from models.JEPAVTS import Model as JEPAVTS
+        model = JEPAVTS(self.args).float()
+        
+        if self.args.use_multi_gpu and self.args.use_gpu:
+            model = nn.DataParallel(model, device_ids=self.args.device_ids)
+        return model
+    
+    def _get_data(self, flag):
+        data_set, data_loader = data_provider(self.args, flag)
+        return data_set, data_loader
+    
+    def _select_optimizer(self):
+        # Only student and predictor are trainable (teacher is frozen)
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        return model_optim
+    
+    def _select_criterion(self):
+        return nn.MSELoss()
+    
+    def _jepa_loss(self, predicted, target, loss_type='mse'):
+        """JEPA alignment loss"""
+        if loss_type == 'cosine':
+            # Cosine similarity loss
+            return 1 - torch.nn.functional.cosine_similarity(predicted, target, dim=-1).mean()
+        else:
+            # MSE loss
+            return torch.nn.functional.mse_loss(predicted, target)
+    
+    def vali(self, vali_data, vali_loader, criterion):
+        total_loss = []
+        self.model.eval()
+        
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+                
+                # Decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                
+                # Inference mode (only returns predictions)
+                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:]
+                
+                loss = criterion(outputs, batch_y)
+                total_loss.append(loss.item())
+        
+        self.model.train()
+        return np.average(total_loss)
+    
+    def train(self, setting):
+        train_data, train_loader = self._get_data(flag='train')
+        vali_data, vali_loader = self._get_data(flag='val')
+        test_data, test_loader = self._get_data(flag='test')
+        
+        path = os.path.join(self.args.checkpoints, setting)
+        if not os.path.exists(path):
+            os.makedirs(path)
+        
+        time_now = time.time()
+        train_steps = len(train_loader)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+        
+        model_optim = self._select_optimizer()
+        criterion = self._select_criterion()
+        
+        jepa_weight = getattr(self.args, 'jepa_weight', 1.0)
+        jepa_loss_type = getattr(self.args, 'jepa_loss_type', 'mse')
+        
+        # Get model reference for architecture check
+        model_ref = self.model.module if hasattr(self.model, 'module') else self.model
+        arch_type = 'DUAL ENCODER' if model_ref.use_dual_encoder else 'SINGLE ENCODER'
+        
+        print(f"\n🎯 Training Configuration:")
+        print(f"   - Architecture: {arch_type}")
+        print(f"   - JEPA Weight: {jepa_weight}")
+        print(f"   - JEPA Loss Type: {jepa_loss_type}")
+        print(f"   - Batch Size: {self.args.batch_size}")
+        print(f"   - Learning Rate: {self.args.learning_rate}")
+        print(f"   - Train Steps per Epoch: {train_steps}\n")
+        
+        for epoch in range(self.args.train_epochs):
+            iter_count = 0
+            train_loss = []
+            train_pred_loss = []
+            train_jepa_loss = []
+            
+            self.model.train()
+            epoch_time = time.time()
+            
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                iter_count += 1
+                model_optim.zero_grad()
+                
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+                
+                # Decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                
+                # 1. Teacher forward (frozen, no grad)
+                teacher_encoding = model_ref.teacher_forward(batch_x)
+                
+                # 2. Student forward - handle both architectures
+                model_outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                
+                if model_ref.use_dual_encoder:
+                    # Dual encoder: (predictions, predicted_teacher_encoding)
+                    predictions = model_outputs[0]
+                    predicted_teacher_encoding = model_outputs[1]
+                else:
+                    # Single encoder: (predictions, student_encoding, predicted_teacher_encoding)
+                    predictions = model_outputs[0]
+                    student_encoding = model_outputs[1]
+                    predicted_teacher_encoding = model_outputs[2]
+                
+                # 3. Prediction loss
+                f_dim = -1 if self.args.features == 'MS' else 0
+                pred_outputs = predictions[:, -self.args.pred_len:, f_dim:]
+                true_outputs = batch_y[:, -self.args.pred_len:, f_dim:]
+                pred_loss = criterion(pred_outputs, true_outputs)
+                
+                # 4. JEPA alignment loss
+                jepa_loss = self._jepa_loss(predicted_teacher_encoding, 
+                                           teacher_encoding.detach(), 
+                                           jepa_loss_type)
+                
+                # 5. Combined loss
+                loss = pred_loss + jepa_weight * jepa_loss
+                
+                train_loss.append(loss.item())
+                train_pred_loss.append(pred_loss.item())
+                train_jepa_loss.append(jepa_loss.item())
+                
+                if (i + 1) % 100 == 0:
+                    print(f"\t📈 Iter: {i+1}/{train_steps}, Epoch: {epoch+1}/{self.args.train_epochs} [{arch_type}]")
+                    print(f"\t   Total Loss: {loss.item():.7f}")
+                    print(f"\t   Pred Loss: {pred_loss.item():.7f}")
+                    print(f"\t   JEPA Loss: {jepa_loss.item():.7f}")
+                    speed = (time.time() - time_now) / iter_count
+                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                    print(f'\t   ⏱️  Speed: {speed:.4f}s/iter; Left: {left_time/60:.2f}min\n')
+                    iter_count = 0
+                    time_now = time.time()
+                
+                loss.backward()
+                model_optim.step()
+            
+            print(f"✅ Epoch {epoch+1} completed in {(time.time() - epoch_time)/60:.2f} minutes")
+            train_loss = np.average(train_loss)
+            train_pred_loss = np.average(train_pred_loss)
+            train_jepa_loss = np.average(train_jepa_loss)
+            
+            print(f"📊 Validating...")
+            vali_loss = self.vali(vali_data, vali_loader, criterion)
+            test_loss = self.vali(test_data, test_loader, criterion)
+            
+            print(f"\n{'='*70}")
+            print(f"📊 Epoch {epoch+1} Summary:")
+            print(f"   Train Loss: {train_loss:.7f} (Pred: {train_pred_loss:.7f}, JEPA: {train_jepa_loss:.7f})")
+            print(f"   Vali Loss:  {vali_loss:.7f}")
+            print(f"   Test Loss:  {test_loss:.7f}")
+            print(f"{'='*70}\n")
+            
+            early_stopping(vali_loss, self.model, path)
+            if early_stopping.early_stop:
+                print("⚠️ Early stopping triggered!")
+                break
+            
+            adjust_learning_rate(model_optim, epoch + 1, self.args)
+        
+        best_model_path = path + '/' + 'checkpoint.pth'
+        self.model.load_state_dict(torch.load(best_model_path))
+        print(f"✅ Best model loaded from {best_model_path}")
+        
+        return self.model
+    
+    def test(self, setting, test=0):
+        test_data, test_loader = self._get_data(flag='test')
+        if test:
+            print('📂 Loading model...')
+            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+        
+        preds = []
+        trues = []
+        folder_path = './test_results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+        
+        self.model.eval()
+        print("🧪 Running test...")
+        
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+                
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                
+                # Inference mode
+                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, :]
+                batch_y = batch_y[:, -self.args.pred_len:, :]
+                
+                outputs = outputs.detach().cpu().numpy()
+                batch_y = batch_y.detach().cpu().numpy()
+                
+                if test_data.scale and self.args.inverse:
+                    shape = batch_y.shape
+                    outputs = test_data.inverse_transform(outputs.reshape(shape[0] * shape[1], -1)).reshape(shape)
+                    batch_y = test_data.inverse_transform(batch_y.reshape(shape[0] * shape[1], -1)).reshape(shape)
+                
+                outputs = outputs[:, :, f_dim:]
+                batch_y = batch_y[:, :, f_dim:]
+                
+                preds.append(outputs)
+                trues.append(batch_y)
+                
+                if i % 20 == 0:
+                    input_data = batch_x.detach().cpu().numpy()
+                    if test_data.scale and self.args.inverse:
+                        shape = input_data.shape
+                        input_data = test_data.inverse_transform(input_data.reshape(shape[0] * shape[1], -1)).reshape(shape)
+                    gt = np.concatenate((input_data[0, :, -1], batch_y[0, :, -1]), axis=0)
+                    pd = np.concatenate((input_data[0, :, -1], outputs[0, :, -1]), axis=0)
+                    visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+        
+        preds = np.concatenate(preds, axis=0)
+        trues = np.concatenate(trues, axis=0)
+        print(f'📊 Test shape: {preds.shape}, {trues.shape}')
+        
+        folder_path = './results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+        
+        mae, mse, rmse, mape, mspe = metric(preds, trues)
+        print(f'\n{"="*70}')
+        print(f'📊 Test Results:')
+        print(f'   MSE:  {mse:.7f}')
+        print(f'   MAE:  {mae:.7f}')
+        print(f'   RMSE: {rmse:.7f}')
+        print(f'   MAPE: {mape:.7f}')
+        print(f'   MSPE: {mspe:.7f}')
+        print(f'{"="*70}\n')
+        
+        f = open("result_jepa_vts.txt", 'a')
+        f.write(setting + "  \n")
+        f.write(f'mse:{mse}, mae:{mae}, rmse:{rmse}, mape:{mape}, mspe:{mspe}\n\n')
+        f.close()
+        
+        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
+        np.save(folder_path + 'pred.npy', preds)
+        np.save(folder_path + 'true.npy', trues)
+        
+        print(f'✅ Results saved to {folder_path}')
+        
+        return

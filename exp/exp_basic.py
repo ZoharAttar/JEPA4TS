@@ -1,16 +1,16 @@
 import os
 import torch
-from models import Autoformer, Transformer, TimesNet, Nonstationary_Transformer, DLinear, FEDformer, \
-    Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, FiLM, iTransformer, \
-    Koopa, TiDE, FreTS, TimeMixer, TSMixer, SegRNN, MambaSimple, TemporalFusionTransformer, SCINet, PAttn, TimeXer, \
-    WPMixer, MultiPatchFormer, KANAD, MSGNet, TimeFilter, Sundial, TimeMoE, Chronos, Moirai, TiRex,\
-    TimesFM, Toto, Chronos2
+from models import (
+    Autoformer, Transformer, TimesNet, Nonstationary_Transformer, DLinear, FEDformer,
+    Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, 
+    FiLM, iTransformer, Koopa, TiDE, FreTS, TimeMixer, TSMixer, SegRNN, MambaSimple, 
+    TemporalFusionTransformer, SCINet, PAttn, TimeXer, WPMixer, MultiPatchFormer, 
+    KANAD, MSGNet, TimeFilter
+)
 
 
 class Exp_Basic(object):
-    def __init__(self, args):
-        self.args = args
-        self.model_dict = {
+    MODEL_DICT = {
             'TimesNet': TimesNet,
             'Autoformer': Autoformer,
             'Transformer': Transformer,
@@ -35,23 +35,19 @@ class Exp_Basic(object):
             'TSMixer': TSMixer,
             'SegRNN': SegRNN,
             'TemporalFusionTransformer': TemporalFusionTransformer,
-            "SCINet": SCINet,
+            'SCINet': SCINet,
             'PAttn': PAttn,
             'TimeXer': TimeXer,
             'WPMixer': WPMixer,
             'MultiPatchFormer': MultiPatchFormer,
             'KANAD': KANAD,
             'MSGNet': MSGNet,
-            'TimeFilter': TimeFilter,
-            'Sundial': Sundial,
-            'TimeMoE': TimeMoE,
-            'Chronos': Chronos,
-            'Moirai': Moirai,
-            'TiRex': TiRex,
-            'TimesFM': TimesFM,
-            'Toto': Toto,
-            'Chronos2': Chronos2
+            'TimeFilter': TimeFilter
         }
+
+    def __init__(self, args):
+        self.args = args
+        self.model_dict = Exp_Basic.MODEL_DICT
         if args.model == 'Mamba':
             print('Please make sure you have successfully installed mamba_ssm')
             from models import Mamba

@@ -79,7 +79,7 @@ class Model(nn.Module):
             self.projection = nn.Linear(
                 self.head_nf * configs.enc_in, configs.num_class)
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+    def encode(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         # Normalization from Non-stationary Transformer
         means = x_enc.mean(1, keepdim=True).detach()
         x_enc = x_enc - means
@@ -100,16 +100,22 @@ class Model(nn.Module):
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
         # z: [bs x nvars x d_model x patch_num]
         enc_out = enc_out.permute(0, 1, 3, 2)
+        return enc_out, means, stdev
 
-        # Decoder
+    def forecast_decode(self, enc_out, means, stdev):
         dec_out = self.head(enc_out)  # z: [bs x nvars x target_window]
         dec_out = dec_out.permute(0, 2, 1)
-
-        # De-Normalization from Non-stationary Transformer
         dec_out = dec_out * \
                   (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
         dec_out = dec_out + \
                   (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
+        return dec_out
+
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        enc_out, means, stdev = self.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+
+        # Decoder
+        dec_out = self.forecast_decode(enc_out, means, stdev)
         return dec_out
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):

@@ -3,6 +3,7 @@ import os
 import torch
 import torch.backends
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
+from exp.exp_jepa_vts_long_term_forecasting import Exp_JEPA_VTS_Long_Term_Forecast
 from exp.exp_imputation import Exp_Imputation
 from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
 from exp.exp_anomaly_detection import Exp_Anomaly_Detection
@@ -137,6 +138,23 @@ if __name__ == '__main__':
                         help="Discrimitive shapeDTW warp preset augmentation")
     parser.add_argument('--extra_tag', type=str, default="", help="Anything extra")
 
+    # JEPA-VTS specific arguments
+    parser.add_argument('--student_model', type=str, default='PatchTST',
+                        help='Student TS model: PatchTST, TimesNet, DLinear, iTransformer, Transformer')
+    parser.add_argument('--jepa_weight', type=float, default=1.0,
+                        help='Weight for JEPA alignment loss')
+    parser.add_argument('--jepa_hidden_dim', type=int, default=512,
+                        help='Hidden dimension for JEPA predictor')
+    parser.add_argument('--jepa_num_layers', type=int, default=2,
+                        help='Number of layers in JEPA predictor')
+    parser.add_argument('--jepa_loss_type', type=str, default='mse', choices=['mse', 'cosine'],
+                        help='JEPA loss type: mse or cosine')
+    parser.add_argument('--use_dual_encoder', action='store_true', default=False,
+                    help='Use dual encoder architecture (one for prediction, one for JEPA)')
+    parser.add_argument('--fusion_type', type=str, default='mlp',
+                        choices=['add', 'weighted', 'mlp'],
+                        help='How to fuse dual encoders: add, weighted, or mlp')
+
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
 
@@ -176,8 +194,13 @@ if __name__ == '__main__':
     print('Args in experiment:')
     print_args(args)
 
+    # if args.task_name == 'long_term_forecast':
+    #     Exp = Exp_Long_Term_Forecast
     if args.task_name == 'long_term_forecast':
-        Exp = Exp_Long_Term_Forecast
+      if args.model == 'JEPAVTS':
+          Exp = Exp_JEPA_VTS_Long_Term_Forecast
+      else:
+          Exp = Exp_Long_Term_Forecast
     elif args.task_name == 'short_term_forecast':
         Exp = Exp_Short_Term_Forecast
     elif args.task_name == 'imputation':
