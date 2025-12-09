@@ -154,6 +154,8 @@ if __name__ == '__main__':
     parser.add_argument('--fusion_type', type=str, default='mlp',
                         choices=['add', 'weighted', 'mlp'],
                         help='How to fuse dual encoders: add, weighted, or mlp')
+    parser.add_argument('--vit_model', type=str, default='vit_base_patch16_224',
+                    help='Vision Transformer model for teacher encoder')
 
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
