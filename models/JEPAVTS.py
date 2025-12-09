@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import timm
+from utils.plotting import visionTS_plot
 
 class VisionTSTeacher(nn.Module):
     """
@@ -9,96 +10,19 @@ class VisionTSTeacher(nn.Module):
     VisionTS handles time series to visual conversion internally
     """
     
-    def __init__(self, seq_len, n_vars, frozen=True):
+    def __init__(self, vit_model='vit_base_patch16_224'):
         super().__init__()
+        #load ViT
+        self.vis_fm = timm.create_model(vit_model, pretrained=True)
+        self.vis_fm.eval()
+        for param in self.vis_fm.parameters():
+            param.requires_grad = False
         
-        try:
-            from visionts import VisionTS
-            print("Loading VisionTS model...")
-            
-            # Initialize VisionTS with checkpoint directory
-            self.visionts = VisionTS(arch='mae_base', ckpt_dir='./ckpt/')
-            
-            print("✅ VisionTS loaded successfully")
-            
-        except Exception as e:
-            print(f"⚠️ Error loading VisionTS: {e}")
-            import traceback
-            traceback.print_exc()
-            self.visionts = None
-        
-        # VisionTS outputs 768-dim embeddings (MAE base)
-        self.hidden_size = 768
-        self.seq_len = seq_len
-        self.n_vars = n_vars
-        
-        # Hyperparameters for VisionTS (from their demo)
-        # These control how VisionTS processes time series as images
-        self.align_const = 0.4  # Alignment constant for image generation
-        self.norm_const = 0.4   # Normalization constant
-        self.periodicity = 1    # Periodicity (1 for non-seasonal data)
-        
-        # Create fallback projection
-        self.fallback_proj = nn.Linear(n_vars, self.hidden_size)
-        
-        if frozen:
-            for param in self.parameters():
-                param.requires_grad = False
-            self.eval()
     
     def forward(self, x_enc):
-        """
-        x_enc: [batch_size, seq_len, n_vars] - raw time series
-        Returns: [batch_size, hidden_size] - teacher encoding
-        """
-        with torch.no_grad():
-            batch_size = x_enc.shape[0]
-            
-            if self.visionts is not None:
-                try:
-                    # ✅ Step 1: Update config (REQUIRED before each forward)
-                    context_len = x_enc.shape[1]
-                    pred_len = context_len  # Same length for encoding
-                    
-                    self.visionts.update_config(
-                        context_len,
-                        pred_len,
-                        align_const=self.align_const,
-                        norm_const=self.norm_const,
-                        periodicity=self.periodicity
-                    )
-                    
-                    # ✅ Step 2: Call VisionTS forward
-                    # Returns predictions [batch, pred_len, n_vars]
-                    y_pred = self.visionts.forward(x_enc)
-                    
-                    # ✅ Step 3: Convert predictions to embedding
-                    # Pool across time and variables to get fixed-size embedding
-                    embedding = y_pred.reshape(batch_size, -1)  # Flatten [batch, pred_len*n_vars]
-                    
-                    # Project to target hidden size
-                    if not hasattr(self, 'visionts_proj'):
-                        input_dim = embedding.shape[-1]
-                        self.visionts_proj = nn.Linear(input_dim, self.hidden_size).to(x_enc.device)
-                        self.visionts_proj.requires_grad = False
-                    
-                    embedding = self.visionts_proj(embedding)  # [batch, hidden_size]
-                    
-                    # print(f"✅ VisionTS working! Output: {embedding.shape}")
-                    return embedding
-                    
-                except Exception as e:
-                    print(f"⚠️ VisionTS failed: {e}, using fallback")
-                    # Print traceback only once for debugging
-                    if not hasattr(self, '_error_logged'):
-                        import traceback
-                        traceback.print_exc()
-                        self._error_logged = True
-            
-            # Fallback: Simple pooling + projection
-            pooled = x_enc.mean(dim=1)  # [batch, n_vars]
-            embedding = self.fallback_proj(pooled)  # [batch, hidden_size]
-            return embedding
+        x_image = visionTS_plot(x_enc)
+        teacher_encoding = self.vis_fm(x_image)
+        return teacher_encoding
 
 
 class JEPAPredictor(nn.Module):
@@ -252,13 +176,10 @@ class Model(nn.Module):
         student_model_name = getattr(configs, 'student_model', 'PatchTST')
         
         # Teacher: VisionTS (frozen)
-        print(f"\n📊 Loading VisionTS as frozen teacher...")
+        print(f"\n📊 Loading teacher vision encoder...")
         self.teacher = VisionTSTeacher(
-            seq_len=configs.seq_len,
-            n_vars=configs.enc_in,
-            frozen=True
+            vit_model=getattr(configs, 'vit_model', 'vit_base_patch16_224')
         )
-        self.teacher.eval()
         self.teacher_dim = self.teacher.hidden_size
         print(f"✅ Teacher dimension: {self.teacher_dim}")
         
