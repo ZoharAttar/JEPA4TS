@@ -17,12 +17,35 @@ class VisionTSTeacher(nn.Module):
         self.vis_fm.eval()
         for param in self.vis_fm.parameters():
             param.requires_grad = False
+
+        # Get hidden dimension from ViT model
+        if hasattr(self.vis_fm, 'num_features'):
+            self.hidden_size = self.vis_fm.num_features
+        elif hasattr(self.vis_fm, 'embed_dim'):
+            self.hidden_size = self.vis_fm.embed_dim
+        elif hasattr(self.vis_fm, 'head'):
+            # Get from classifier head input features
+            self.hidden_size = self.vis_fm.head.in_features
+        else:
+            # Default for vit_base_patch16_224
+            self.hidden_size = 768
+            print(f"⚠️ Could not detect hidden_size, using default: {self.hidden_size}")
+        
+        print(f"✅ ViT Teacher loaded: {vit_model}")
+        print(f"✅ Teacher hidden_size: {self.hidden_size}")
         
     
+    # def forward(self, x_enc):
+    #     x_image = visionTS_plot(x_enc)
+    #     teacher_encoding = self.vis_fm(x_image)
+    #     return teacher_encoding
+
     def forward(self, x_enc):
-        x_image = visionTS_plot(x_enc)
-        teacher_encoding = self.vis_fm(x_image)
-        return teacher_encoding
+      with torch.no_grad():
+          x_image = visionTS_plot(x_enc)
+          # Get features, not classification
+          teacher_encoding = self.vis_fm.forward_features(x_image)[:, 0, :]  # CLS token
+          return teacher_encoding
 
 
 class JEPAPredictor(nn.Module):
