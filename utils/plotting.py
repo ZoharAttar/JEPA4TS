@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 import einops
 
-def visionTS_plot(x, norm_const=0.4, periodicity=1, image_size=224, 
+def visionTS_plot(x, norm_const=0.4, periodicity=1, image_size=518, 
                   clip_range=(-5, 5), fp64=False):
     """
     Convert time series to image for Vision Transformer input
@@ -70,14 +70,11 @@ def visionTS_plot(x, norm_const=0.4, periodicity=1, image_size=224,
         mode='bilinear',
         align_corners=False
     )
+    x_resized = x_resized.mean(dim=1).unsqueeze(1)
+    # Example:
+    # Input:  x_2d = [112, 1, 1, 96]    # 112 batches, 1 vars, 1 period, 96 timesteps
+    # Output: x_resized = [112, 1, 224, 224]  # Resized to image dimensions
     
-    # 5. Average across variables to create grayscale image
-    x_gray = x_resized.mean(dim=1, keepdim=True)  # [batch, 1, 224, 224]
+    input_image = einops.repeat(x_resized, 'b 1 h w -> b c h w', c=3)
     
-    # 6. Clip values
-    x_gray = torch.clamp(x_gray, clip_range[0], clip_range[1])
-    
-    # 7. Convert to 3-channel RGB (repeat grayscale)
-    x_rgb = x_gray.repeat(1, 3, 1, 1)  # [batch, 3, 224, 224]
-    
-    return x_rgb
+    return input_image
