@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 from utils.plotting import visionTS_plot
+from transformers import ViTModel
+
 
 class VisionTSTeacher(nn.Module):
     """
@@ -13,13 +15,16 @@ class VisionTSTeacher(nn.Module):
     def __init__(self, vit_model='vit_base_patch16_224'):
         super().__init__()
         #load ViT
-        self.vis_fm = timm.create_model(vit_model, pretrained=True)
+        self.vis_fm = ViTModel.from_pretrained("facebook/vit-mae-base")
+        # self.vis_fm = timm.create_model(vit_model, pretrained=True)
         self.vis_fm.eval()
         for param in self.vis_fm.parameters():
             param.requires_grad = False
 
         # Get hidden dimension from ViT model
-        self.hidden_size = self.vis_fm.num_features
+        # self.hidden_size = self.vis_fm.num_features
+        self.hidden_size = self.vis_fm.config.hidden_size
+
 
         print(f"✅ ViT Teacher loaded: {vit_model}")
         print(f"✅ Teacher hidden_size: {self.hidden_size}")
@@ -27,7 +32,9 @@ class VisionTSTeacher(nn.Module):
 
     def forward(self, x_enc):
         x_image = visionTS_plot(x_enc)
-        teacher_encoding = self.vis_fm.forward_features(x_image)[:, 0, :]  # CLS token
+        # teacher_encoding = self.vis_fm.forward_features(x_image)[:, 0, :]  # CLS token
+        outputs = self.vis_fm(pixel_values=x_image)
+        teacher_encoding = outputs.last_hidden_state[:, 0, :]  # CLS token
         return teacher_encoding
 
 
