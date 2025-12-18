@@ -1,30 +1,9 @@
-# import torch
-# import torch.nn.functional as F
-# import einops
-
-# def visionTS_plot (x, norm_const=0.4, pad_left=0, periodicity=1, fp64=False): #add defult like visionTS
-#     # 1. Normalization
-#     means = x.mean(1, keepdim=True).detach()  # [bs x 1 x nvars]
-#     x_enc = x - means
-#     stdev = torch.sqrt(
-#         torch.var(x_enc.to(torch.float64) if fp64 else x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)  # [bs x 1 x nvars]
-#     stdev /= norm_const
-#     x_enc /= stdev
-#     # Channel Independent
-#     x_enc = einops.rearrange(x_enc, 'b s n -> b n s') # [bs x nvars x seq_len]
-
-#     # 2. Segmentation
-#     x_pad = F.pad(x_enc, (pad_left, 0), mode='replicate') # [b n s]
-#     x_2d = einops.rearrange(x_pad, 'b n (p f) -> (b n) 1 f p', f=periodicity)
-#     return x_2d
-
-
 import torch
 import torch.nn.functional as F
 import einops
 
-def visionTS_plot(x, norm_const=0.4, periodicity=1, image_size=518, 
-                  clip_range=(-5, 5), fp64=False):
+def visionTS_plot(x, norm_const=0.4, periodicity=1, image_size=224
+                  , fp64=False):
     """
     Convert time series to image for Vision Transformer input
     
@@ -33,11 +12,10 @@ def visionTS_plot(x, norm_const=0.4, periodicity=1, image_size=518,
         norm_const: Normalization constant (default: 0.4)
         periodicity: Periodicity for segmentation (default: 1)
         image_size: Output image size (default: 224)
-        clip_range: Clipping range (default: (-5, 5))
         fp64: Use float64 for variance (default: False)
     
     Returns:
-        image: [batch, 3, 224, 224] RGB image for ViT
+        image: image for ViT
     """
     batch_size, seq_len, nvars = x.shape
     
@@ -71,10 +49,7 @@ def visionTS_plot(x, norm_const=0.4, periodicity=1, image_size=518,
         align_corners=False
     )
     x_resized = x_resized.mean(dim=1).unsqueeze(1)
-    # Example:
-    # Input:  x_2d = [112, 1, 1, 96]    # 112 batches, 1 vars, 1 period, 96 timesteps
-    # Output: x_resized = [112, 1, 224, 224]  # Resized to image dimensions
-    
+
     input_image = einops.repeat(x_resized, 'b 1 h w -> b c h w', c=3)
     
     return input_image
