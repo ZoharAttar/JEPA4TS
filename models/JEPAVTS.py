@@ -2,40 +2,88 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from utils.plotting import visionTS_plot
+from utils.plotting import visionTS_plot, transform_RP_batch
 from transformers import ViTModel
-
+import os
+import hashlib
+import numpy as np
 
 class VisionTSTeacher(nn.Module):
     """
-    Wrapper around VisionTS to use as frozen teacher encoder
-    VisionTS handles time series to visual conversion internally
+    Loads pre-computed DINO embeddings from cache.
+    Works with ANY batch size since each sample is cached individually by hash.
     """
     
-    def __init__(self, vit_model='facebook/dinov2-base'):
+    def __init__(self, cache_dir="./dataset/ETT-small/dino_embeddings", hidden_size=768):
         super().__init__()
-        #load ViT
-        self.vis_fm = ViTModel.from_pretrained("facebook/dinov2-base")
-        # self.vis_fm = timm.create_model(vit_model, pretrained=True)
-        self.vis_fm.eval()
-        for param in self.vis_fm.parameters():
-            param.requires_grad = False
-
-        # Get hidden dimension from ViT model
-        # self.hidden_size = self.vis_fm.num_features
-        self.hidden_size = self.vis_fm.config.hidden_size
-
-
-        print(f"✅ ViT Teacher loaded: {vit_model}")
+        self.cache_dir = cache_dir
+        self.hidden_size = hidden_size
+        
+        if not os.path.exists(cache_dir):
+            raise ValueError(f"❌ Cache not found: {cache_dir}\n   Run precompute_embeddings.py first!")
+        
+        n_cached = len([f for f in os.listdir(cache_dir) if f.endswith('.npy')])
+        print(f"✅ VisionTSTeacher: Loading from cache")
+        print(f"✅ Cache dir: {cache_dir}")
+        print(f"✅ Cached embeddings: {n_cached}")
         print(f"✅ Teacher hidden_size: {self.hidden_size}")
+    
+    def _get_hash(self, ts_array):
+        return hashlib.md5(ts_array.astype(np.float32).tobytes()).hexdigest()[:16]
+    
+    def forward(self, x_enc):
+        """
+        x_enc: [batch, seq_len, nvars] - ANY batch size works!
+        Returns: [batch, hidden_size]
+        """
+        batch_size = x_enc.shape[0]
+        device = x_enc.device
+        x_np = x_enc.detach().cpu().numpy().astype(np.float32)
+        
+        embeddings = []
+        for i in range(batch_size):
+            ts_hash = self._get_hash(x_np[i])
+            cache_path = os.path.join(self.cache_dir, f"{ts_hash}.npy")
+            
+            if os.path.exists(cache_path):
+                emb = np.load(cache_path)
+            else:
+                raise FileNotFoundError(f"Embedding not found: {cache_path}\nRun precompute_embeddings.py!")
+            
+            embeddings.append(torch.tensor(emb, dtype=torch.float32))
+        
+        return torch.stack(embeddings, dim=0).to(device)
+
+# class VisionTSTeacher(nn.Module):
+#     """
+#     Wrapper around VisionTS to use as frozen teacher encoder
+#     VisionTS handles time series to visual conversion internally
+#     """
+    
+#     def __init__(self, vit_model='facebook/dinov2-base'):
+#         super().__init__()
+#         #load ViT
+#         self.vis_fm = ViTModel.from_pretrained("facebook/dinov2-base")
+#         # self.vis_fm = timm.create_model(vit_model, pretrained=True)
+#         self.vis_fm.eval()
+#         for param in self.vis_fm.parameters():
+#             param.requires_grad = False
+
+#         # Get hidden dimension from ViT model
+#         # self.hidden_size = self.vis_fm.num_features
+#         self.hidden_size = self.vis_fm.config.hidden_size
+
+
+#         print(f"✅ ViT Teacher loaded: {vit_model}")
+#         print(f"✅ Teacher hidden_size: {self.hidden_size}")
         
 
-    def forward(self, x_enc):
-        x_image = visionTS_plot(x_enc)
-        # teacher_encoding = self.vis_fm.forward_features(x_image)[:, 0, :]  # CLS token
-        outputs = self.vis_fm(pixel_values=x_image)
-        teacher_encoding = outputs.last_hidden_state[:, 0, :]  # CLS token
-        return teacher_encoding
+#     def forward(self, x_enc):
+#         x_image = transform_RP_batch(x_enc)
+#         # teacher_encoding = self.vis_fm.forward_features(x_image)[:, 0, :]  # CLS token
+#         outputs = self.vis_fm(pixel_values=x_image)
+#         teacher_encoding = outputs.last_hidden_state[:, 0, :]  # CLS token
+#         return teacher_encoding
 
 
 class JEPAPredictor(nn.Module):
@@ -190,9 +238,7 @@ class Model(nn.Module):
         
         # Teacher: VisionTS (frozen)
         print(f"\n📊 Loading teacher vision encoder...")
-        self.teacher = VisionTSTeacher(
-            vit_model=getattr(configs, 'vit_model', 'vit_base_patch16_224')
-        )
+        self.teacher = VisionTSTeacher()
         self.teacher_dim = self.teacher.hidden_size
         print(f"✅ Teacher dimension: {self.teacher_dim}")
         
