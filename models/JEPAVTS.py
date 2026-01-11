@@ -12,10 +12,10 @@ class VisionTSTeacher(nn.Module):
     VisionTS handles time series to visual conversion internally
     """
     
-    def __init__(self, vit_model='vit_base_patch16_224'):
+    def __init__(self, vit_model='facebook/dinov2-base'):
         super().__init__()
         #load ViT
-        self.vis_fm = ViTModel.from_pretrained("facebook/vit-mae-base")
+        self.vis_fm = ViTModel.from_pretrained("facebook/dinov2-base")
         # self.vis_fm = timm.create_model(vit_model, pretrained=True)
         self.vis_fm.eval()
         for param in self.vis_fm.parameters():
