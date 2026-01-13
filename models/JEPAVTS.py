@@ -14,17 +14,17 @@ class VisionTSTeacher(nn.Module):
     Works with ANY batch size since each sample is cached individually by hash.
     """
     
-    def __init__(self, cache_dir="./dataset/ETT-small/dino_embeddings", hidden_size=768):
+    def __init__(self, dataset_name="ETTh1", hidden_size=768):
         super().__init__()
-        self.cache_dir = cache_dir
+        self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}"
         self.hidden_size = hidden_size
         
-        if not os.path.exists(cache_dir):
-            raise ValueError(f"❌ Cache not found: {cache_dir}\n   Run precompute_embeddings.py first!")
+        if not os.path.exists(self.cache_dir):
+            raise ValueError(f"❌ Cache not found: {self.cache_dir}\n   Run precompute_embeddings.py first!")
         
-        n_cached = len([f for f in os.listdir(cache_dir) if f.endswith('.npy')])
+        n_cached = len([f for f in os.listdir(self.cache_dir) if f.endswith('.npy')])
         print(f"✅ VisionTSTeacher: Loading from cache")
-        print(f"✅ Cache dir: {cache_dir}")
+        print(f"✅ Cache dir: {self.cache_dir}")
         print(f"✅ Cached embeddings: {n_cached}")
         print(f"✅ Teacher hidden_size: {self.hidden_size}")
     
@@ -238,7 +238,8 @@ class Model(nn.Module):
         
         # Teacher: VisionTS (frozen)
         print(f"\n📊 Loading teacher vision encoder...")
-        self.teacher = VisionTSTeacher()
+        self.data = getattr(configs, 'data')
+        self.teacher = VisionTSTeacher(dataset_name=self.data)
         self.teacher_dim = self.teacher.hidden_size
         print(f"✅ Teacher dimension: {self.teacher_dim}")
         
