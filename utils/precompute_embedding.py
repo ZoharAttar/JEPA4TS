@@ -6,7 +6,7 @@ import hashlib
 import argparse
 import shutil
 from tqdm import tqdm
-from transformers import ViTModel
+from transformers import AutoModel
 import torch.nn.functional as F
 import einops
 from pyts.image import RecurrencePlot
@@ -155,7 +155,7 @@ def precompute_for_dataset(dataset_name, seq_len=96, label_len=48, pred_len=96, 
     )
     
     print("\nLoading DINO...")
-    dino = ViTModel.from_pretrained("facebook/dinov2-base").to(DEVICE)
+    dino = AutoModel.from_pretrained("facebook/dinov2-base").to(DEVICE)
     dino.eval()
     
     existing = set(f.replace('.npy', '') for f in os.listdir(cache_dir) if f.endswith('.npy'))
