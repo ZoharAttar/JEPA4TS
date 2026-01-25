@@ -180,13 +180,15 @@ class Model(nn.Module):
                       1, self.pred_len + self.seq_len, 1)))
         return dec_out
 
-    def classification(self, x_enc, x_mark_enc):
+    def encode(self, x_enc):
         # embedding
         enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
         # TimesNet
         for i in range(self.layer):
             enc_out = self.layer_norm(self.model[i](enc_out))
+        return enc_out
 
+    def classification_decode(self, enc_out, x_mark_enc):
         # Output
         # the output transformer encoder/decoder embeddings don't include non-linearity
         output = self.act(enc_out)
@@ -197,6 +199,11 @@ class Model(nn.Module):
         output = output.reshape(output.shape[0], -1)
         output = self.projection(output)  # (batch_size, num_classes)
         return output
+
+    def classification(self, x_enc, x_mark_enc):
+        enc_out = self.encode(x_enc)
+        return self.classification_decode(enc_out, x_mark_enc)
+
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
