@@ -175,8 +175,9 @@ class EncodingFusion(nn.Module):
     
     def forward(self, enc1, enc2):
         """
-        enc1, enc2: [bs, nvars, d_model, patch_num]
-        Returns: [bs, nvars, d_model, patch_num]
+        Supports both 3D and 4D inputs:
+        - 3D (TimesNet): [bs, seq_len, d_model]
+        - 4D (PatchTST): [bs, nvars, d_model, patch_num]
         """
         if self.fusion_type == 'add':
             return enc1 + enc2
@@ -186,20 +187,23 @@ class EncodingFusion(nn.Module):
             return alpha * enc1 + (1 - alpha) * enc2
         
         elif self.fusion_type == 'mlp':
-            # Concatenate
-            concat = torch.cat([enc1, enc2], dim=2)  # [bs, nvars, d_model*2, patch_num]
-            
-            # Reshape for MLP
-            bs, nvars, d_model_2, patch_num = concat.shape
-            concat_flat = concat.permute(0, 1, 3, 2).reshape(-1, d_model_2)
-            
-            # Fuse
-            fused_flat = self.fusion(concat_flat)
-            
-            # Reshape back
-            fused = fused_flat.reshape(bs, nvars, patch_num, -1).permute(0, 1, 3, 2)
-            
-            return fused
+            # Handle both 3D and 4D inputs
+            if enc1.dim() == 3:
+                # 3D input: [bs, seq_len, d_model] (TimesNet)
+                concat = torch.cat([enc1, enc2], dim=-1)  # [bs, seq_len, d_model*2]
+                bs, seq_len, d_model_2 = concat.shape
+                concat_flat = concat.reshape(-1, d_model_2)
+                fused_flat = self.fusion(concat_flat)
+                fused = fused_flat.reshape(bs, seq_len, -1)
+                return fused
+            else:
+                # 4D input: [bs, nvars, d_model, patch_num] (PatchTST)
+                concat = torch.cat([enc1, enc2], dim=2)  # [bs, nvars, d_model*2, patch_num]
+                bs, nvars, d_model_2, patch_num = concat.shape
+                concat_flat = concat.permute(0, 1, 3, 2).reshape(-1, d_model_2)
+                fused_flat = self.fusion(concat_flat)
+                fused = fused_flat.reshape(bs, nvars, patch_num, -1).permute(0, 1, 3, 2)
+                return fused
 
 
 class Model(nn.Module):
