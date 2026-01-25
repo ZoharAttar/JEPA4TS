@@ -257,17 +257,29 @@ class Model(nn.Module):
         self.student_dim = configs.d_model
         print(f"✅ Student dimension: {self.student_dim}")
 
-        # Calculate patch_num dynamically based on student model type
+        # Calculate encoding shape dynamically based on student model type
         student_model_name = getattr(configs, 'student_model', 'PatchTST')
+        self.student_model_name = student_model_name
 
         if student_model_name == 'PatchTST' and hasattr(self.student, 'patch_embedding'):
-            # Get values from PatchTST
+            # PatchTST: encoding shape is [B, nvars, d_model, patch_num]
             patch_len = self.student.patch_embedding.patch_len
             stride = self.student.patch_embedding.stride
             patch_num = int((configs.seq_len - patch_len) / stride + 2)
+            self.encoding_type = '4D'  # [B, nvars, d_model, patch_num]
+            predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
+        elif student_model_name == 'TimesNet':
+            # TimesNet: encoding shape is [B, T, d_model]
+            patch_num = None
+            self.encoding_type = '3D'  # [B, T, d_model]
+            predictor_input_shape = (configs.seq_len, configs.d_model, 1)  # Treat as [B, T, d_model, 1]
         else:
             # For non-patch models (DLinear, etc.), use 1D input
             patch_num = None
+            self.encoding_type = '1D'
+            predictor_input_shape = None
+
+        print(f"✅ Encoding type: {self.encoding_type}")
 
         # JEPA Predictor (trainable)
         print(f"\n🔗 Building JEPA predictor...")
@@ -275,13 +287,40 @@ class Model(nn.Module):
                 student_dim=configs.d_model,
                 teacher_dim=self.teacher_dim,
                 hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
-                input_shape=(configs.enc_in, configs.d_model, patch_num)  # 4D
+                input_shape=predictor_input_shape
             )
         print(f"✅ JEPA predictor: {self.student_dim} -> {self.teacher_dim}")
         
+        # Store patch_num for classification head
+        self.patch_num = patch_num if patch_num is not None else 1
+        
         # Prediction head for forecasting task
-        self.forecast_head = nn.Linear(self.student_dim, configs.pred_len * configs.c_out)
-        print(f"✅ Forecast head: {self.student_dim} -> {configs.pred_len * configs.c_out}")
+        if self.task_name != 'classification':
+            self.forecast_head = nn.Linear(self.student_dim, configs.pred_len * configs.c_out)
+            print(f"✅ Forecast head: {self.student_dim} -> {configs.pred_len * configs.c_out}")
+        
+        # Classification head
+        if self.task_name == 'classification':
+            self.num_classes = configs.num_class
+            # Calculate flatten dimension for classification head based on encoding type
+            if self.encoding_type == '4D':
+                # PatchTST: [B, nvars, d_model, patch_num]
+                flatten_dim = configs.enc_in * configs.d_model * self.patch_num
+            elif self.encoding_type == '3D':
+                # TimesNet: [B, T, d_model]
+                flatten_dim = configs.seq_len * configs.d_model
+            else:
+                flatten_dim = configs.d_model
+            
+            self.classification_head = nn.Sequential(
+                nn.Flatten(start_dim=1),
+                nn.Linear(flatten_dim, configs.d_model),
+                nn.LayerNorm(configs.d_model),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(configs.d_model, self.num_classes)
+            )
+            print(f"✅ Classification head: {flatten_dim} -> {self.num_classes} classes")
         
         print("\n" + "="*50)
         print("JEPAVTS Model Initialized Successfully!")
@@ -362,19 +401,83 @@ class Model(nn.Module):
         
         return forecast_output
     
+    def classification_forward(self, x_enc, padding_mask=None, return_all=False):
+        """
+        Classification forward pass
+        x_enc: [batch, seq_len, n_vars]
+        padding_mask: [batch, seq_len] (optional)
+        Returns: class logits [batch, num_classes]
+        """
+        # Get student encoding 
+        student_encoding = self.student.encode(x_enc)
+        # Classification output
+        class_logits = self.classification_head(student_encoding)
+        
+        if return_all and self.training:
+            # Get JEPA prediction for teacher alignment
+            predicted_teacher_encoding = self.predictor(student_encoding)
+            return class_logits, student_encoding, predicted_teacher_encoding
+        
+        return class_logits
+    
+    def classification_forward_dual_encoder(self, x_enc, padding_mask=None, return_all=False):
+        """
+        Classification forward pass with dual encoder
+        """
+
+        student_encoding1 = self.student1.encode(x_enc)
+        student_encoding2 = self.student2.encode(x_enc)
+        
+        # JEPA prediction from encoder2
+        predicted_teacher_encoding = self.predictor(student_encoding2)
+        
+        # Fuse encodings
+        combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
+        
+        # Classification output
+        class_logits = self.classification_head(combined_encoding)
+        
+        if return_all and self.training:
+            return class_logits, predicted_teacher_encoding
+        
+        return class_logits
+    
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         """
-        Main forward - behavior depends on training mode and architecture
+        Main forward - behavior depends on task_name, training mode and architecture
+        
+        For classification:
+            x_enc: [batch, seq_len, n_vars] - time series input
+            x_mark_enc: padding_mask or None
+            x_dec, x_mark_dec: ignored (can be None)
+        
+        For forecasting:
+            x_enc: [batch, seq_len, n_vars]
+            x_mark_enc: time features
+            x_dec: decoder input
+            x_mark_dec: decoder time features
         """
-        # Choose architecture based on config
+        # Classification task
+        if self.task_name == 'classification':
+            padding_mask = x_mark_enc  # In classification, x_mark_enc is used as padding_mask
+            if self.use_dual_encoder:
+                if self.training:
+                    return self.classification_forward_dual_encoder(x_enc, padding_mask, return_all=True)
+                else:
+                    return self.classification_forward_dual_encoder(x_enc, padding_mask, return_all=False)
+            else:
+                if self.training:
+                    return self.classification_forward(x_enc, padding_mask, return_all=True)
+                else:
+                    return self.classification_forward(x_enc, padding_mask, return_all=False)
+        
+        # Forecasting task (existing code)
         if self.use_dual_encoder:
-            # Use dual encoder architecture
             if self.training:
                 return self.student_forward_dual_encoder(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
             else:
                 return self.student_forward_dual_encoder(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False)
         else:
-            # Use single encoder architecture
             if self.training:
                 return self.student_forward(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
             else:
