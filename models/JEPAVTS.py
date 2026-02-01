@@ -154,9 +154,9 @@ class JEPAPredictor(nn.Module):
 
 class EncodingFusion(nn.Module):
     """
-    Fuses two encoder outputs using MLP
+    Fuses two encoder outputs using MLP, Transformer, or simple operations
     """
-    def __init__(self, d_model, fusion_type='mlp', hidden_factor=2):
+    def __init__(self, d_model, fusion_type='mlp', hidden_factor=2, n_heads=8):
         super().__init__()
         self.fusion_type = fusion_type
         
@@ -168,6 +168,21 @@ class EncodingFusion(nn.Module):
                 nn.Dropout(0.1),
                 nn.Linear(d_model * hidden_factor, d_model)
             )
+        elif fusion_type == 'transformer':
+            # Project concatenated input to d_model
+            self.input_proj = nn.Linear(d_model * 2, d_model)
+            
+            # Transformer encoder with 2 layers
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=d_model * hidden_factor,
+                dropout=0.1,
+                activation='gelu',
+                batch_first=True
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+            
         elif fusion_type == 'weighted':
             self.alpha = nn.Parameter(torch.tensor(0.5))
         elif fusion_type == 'add':
@@ -189,20 +204,38 @@ class EncodingFusion(nn.Module):
         elif self.fusion_type == 'mlp':
             # Handle both 3D and 4D inputs
             if enc1.dim() == 3:
-                # 3D input: [bs, seq_len, d_model] (TimesNet)
-                concat = torch.cat([enc1, enc2], dim=-1)  # [bs, seq_len, d_model*2]
+                concat = torch.cat([enc1, enc2], dim=-1)
                 bs, seq_len, d_model_2 = concat.shape
                 concat_flat = concat.reshape(-1, d_model_2)
                 fused_flat = self.fusion(concat_flat)
                 fused = fused_flat.reshape(bs, seq_len, -1)
                 return fused
             else:
-                # 4D input: [bs, nvars, d_model, patch_num] (PatchTST)
-                concat = torch.cat([enc1, enc2], dim=2)  # [bs, nvars, d_model*2, patch_num]
+                concat = torch.cat([enc1, enc2], dim=2)
                 bs, nvars, d_model_2, patch_num = concat.shape
                 concat_flat = concat.permute(0, 1, 3, 2).reshape(-1, d_model_2)
                 fused_flat = self.fusion(concat_flat)
                 fused = fused_flat.reshape(bs, nvars, patch_num, -1).permute(0, 1, 3, 2)
+                return fused
+        
+        elif self.fusion_type == 'transformer':
+            if enc1.dim() == 3:
+                # 3D: [bs, seq_len, d_model]
+                concat = torch.cat([enc1, enc2], dim=-1)  # [bs, seq_len, d_model*2]
+                projected = self.input_proj(concat)        # [bs, seq_len, d_model]
+                fused = self.transformer(projected)        # [bs, seq_len, d_model]
+                return fused
+            else:
+                # 4D: [bs, nvars, d_model, patch_num]
+                bs, nvars, d_model, patch_num = enc1.shape
+                # Reshape to [bs * nvars, patch_num, d_model] for transformer
+                enc1_3d = enc1.permute(0, 1, 3, 2).reshape(bs * nvars, patch_num, d_model)
+                enc2_3d = enc2.permute(0, 1, 3, 2).reshape(bs * nvars, patch_num, d_model)
+                concat = torch.cat([enc1_3d, enc2_3d], dim=-1)  # [bs*nvars, patch_num, d_model*2]
+                projected = self.input_proj(concat)              # [bs*nvars, patch_num, d_model]
+                fused = self.transformer(projected)              # [bs*nvars, patch_num, d_model]
+                # Reshape back to 4D
+                fused = fused.reshape(bs, nvars, patch_num, d_model).permute(0, 1, 3, 2)
                 return fused
 
 
@@ -326,6 +359,14 @@ class Model(nn.Module):
             )
             print(f"✅ Classification head: {flatten_dim} -> {self.num_classes} classes")
         
+        # Learnable loss weights (uncertainty-based)
+        self.use_learned_loss_weights = getattr(configs, 'learned_loss_weights', False)
+        if self.use_learned_loss_weights:
+            # Initialize log-variance parameters (start with equal weighting ~0.5 each)
+            self.w_pred = nn.Parameter(torch.tensor([0.0]))  # log(σ²) for prediction loss
+            self.w_jepa = nn.Parameter(torch.tensor([0.0]))  # log(σ²) for JEPA loss
+            print(f"✅ Using learned loss weights (uncertainty-based)")
+
         print("\n" + "="*50)
         print("JEPAVTS Model Initialized Successfully!")
         print("="*50 + "\n")
@@ -358,6 +399,28 @@ class Model(nn.Module):
             raise NotImplementedError(f"Student model {model_name} not found")
         
         return Exp_Basic.MODEL_DICT[model_name].Model(configs)
+
+    def compute_weighted_loss(self, pred_loss, jepa_loss):
+      """
+      Uncertainty-based multi-task loss weighting.
+      L = l_pred * exp(-w_pred) + w_pred + l_jepa * exp(-w_jepa) + w_jepa
+      
+      This automatically learns the optimal balance between losses.
+      """
+      if self.use_learned_loss_weights:
+          weighted_pred = pred_loss * torch.exp(-self.w_pred) + self.w_pred
+          weighted_jepa = jepa_loss * torch.exp(-self.w_jepa) + self.w_jepa
+          total_loss = weighted_pred + weighted_jepa
+          
+          # Return individual components for logging
+          return total_loss, {
+              'pred_weight': torch.exp(-self.w_pred).item(),
+              'jepa_weight': torch.exp(-self.w_jepa).item(),
+              'w_pred': self.w_pred.item(),
+              'w_jepa': self.w_jepa.item()
+          }
+      else:
+          return None, None
     
     def teacher_forward(self, x_enc):
         """
