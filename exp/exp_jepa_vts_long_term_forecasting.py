@@ -156,8 +156,14 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                                            jepa_loss_type)
                 
                 # 5. Combined loss
-                loss = pred_loss + jepa_weight * jepa_loss
-                
+                if model_ref.use_learned_loss_weights and predicted_teacher_encoding is not None:
+                    # Uncertainty-based weighting (learns weights automatically)
+                    loss, weight_info = model_ref.compute_weighted_loss(pred_loss, jepa_loss)
+                else:
+                    # Fixed weighting
+                    loss = pred_loss + jepa_weight * jepa_loss
+                    weight_info = None
+
                 train_loss.append(loss.item())
                 train_pred_loss.append(pred_loss.item())
                 train_jepa_loss.append(jepa_loss.item())
@@ -167,6 +173,8 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                     print(f"\t   Total Loss: {loss.item():.7f}")
                     print(f"\t   Pred Loss: {pred_loss.item():.7f}")
                     print(f"\t   JEPA Loss: {jepa_loss.item():.7f}")
+                    if weight_info:
+                        print(f"\t   Learned Weights: pred={weight_info['pred_weight']:.4f}, jepa={weight_info['jepa_weight']:.4f}")
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                     print(f'\t   ⏱️  Speed: {speed:.4f}s/iter; Left: {left_time/60:.2f}min\n')
