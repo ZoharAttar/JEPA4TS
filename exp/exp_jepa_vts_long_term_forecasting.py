@@ -96,7 +96,16 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         
         # Get model reference for architecture check
         model_ref = self.model.module if hasattr(self.model, 'module') else self.model
-        arch_type = 'DUAL ENCODER' if model_ref.use_dual_encoder else 'SINGLE ENCODER'
+        if getattr(model_ref, 'dual_encoder_only', False):
+            arch_type = 'DUAL ENCODER ONLY (no DINO, no JEPA)'
+        elif getattr(model_ref, 'dino_direct', False):
+            arch_type = 'DINO DIRECT (add)'
+        elif getattr(model_ref, 'dino_fusion', False):
+            arch_type = 'DINO FUSION'
+        elif model_ref.use_dual_encoder:
+            arch_type = 'DUAL ENCODER'
+        else:
+            arch_type = 'SINGLE ENCODER'
         
         print(f"\n🎯 Training Configuration:")
         print(f"   - Architecture: {arch_type}")
@@ -128,10 +137,7 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 
-                # 1. Teacher forward (frozen, no grad)
-                teacher_encoding = model_ref.teacher_forward(batch_x)
-                
-                # 2. Student forward - handle both architectures
+                # 2. Student forward - handle all architectures
                 model_outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 
                 if model_ref.use_dual_encoder:
@@ -139,7 +145,7 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                     predictions = model_outputs[0]
                     predicted_teacher_encoding = model_outputs[1]
                 else:
-                    # Single encoder: (predictions, student_encoding, predicted_teacher_encoding)
+                    # Single encoder or DINO modes: (predictions, student_encoding, predicted_teacher_encoding)
                     predictions = model_outputs[0]
                     student_encoding = model_outputs[1]
                     predicted_teacher_encoding = model_outputs[2]
@@ -150,20 +156,19 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                 true_outputs = batch_y[:, -self.args.pred_len:, f_dim:]
                 pred_loss = criterion(pred_outputs, true_outputs)
                 
-                # 4. JEPA alignment loss
-                jepa_loss = self._jepa_loss(predicted_teacher_encoding, 
-                                           teacher_encoding.detach(), 
-                                           jepa_loss_type)
+                # 4. JEPA alignment loss (skip if dino_fusion mode returns None)
+                if predicted_teacher_encoding is not None:
+                    teacher_encoding = model_ref.teacher_forward(batch_x)
+                    jepa_loss = self._jepa_loss(predicted_teacher_encoding, 
+                                               teacher_encoding.detach(), 
+                                               jepa_loss_type)
+                else:
+                    # DINO fusion mode - no JEPA loss
+                    jepa_loss = torch.tensor(0.0, device=self.device)
                 
                 # 5. Combined loss
-                if model_ref.use_learned_loss_weights and predicted_teacher_encoding is not None:
-                    # Uncertainty-based weighting (learns weights automatically)
-                    loss, weight_info = model_ref.compute_weighted_loss(pred_loss, jepa_loss)
-                else:
-                    # Fixed weighting
-                    loss = pred_loss + jepa_weight * jepa_loss
-                    weight_info = None
-
+                loss = pred_loss + jepa_weight * jepa_loss
+                
                 train_loss.append(loss.item())
                 train_pred_loss.append(pred_loss.item())
                 train_jepa_loss.append(jepa_loss.item())
@@ -173,8 +178,6 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                     print(f"\t   Total Loss: {loss.item():.7f}")
                     print(f"\t   Pred Loss: {pred_loss.item():.7f}")
                     print(f"\t   JEPA Loss: {jepa_loss.item():.7f}")
-                    if weight_info:
-                        print(f"\t   Learned Weights: pred={weight_info['pred_weight']:.4f}, jepa={weight_info['jepa_weight']:.4f}")
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                     print(f'\t   ⏱️  Speed: {speed:.4f}s/iter; Left: {left_time/60:.2f}min\n')
