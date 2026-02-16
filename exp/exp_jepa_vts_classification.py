@@ -107,6 +107,26 @@ class Exp_JEPA_VTS_Classification(Exp_Basic):
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
+        # Get model reference for architecture check
+        model_ref = self.model.module if hasattr(self.model, 'module') else self.model
+        if getattr(model_ref, 'dual_encoder_only', False):
+            arch_type = 'DUAL ENCODER ONLY (no DINO, no JEPA)'
+        elif getattr(model_ref, 'dino_direct', False):
+            arch_type = 'DINO DIRECT (concat)'
+        elif getattr(model_ref, 'dino_fusion', False):
+            arch_type = 'DINO FUSION'
+        elif getattr(model_ref, 'use_dual_encoder', False):
+            arch_type = 'DUAL ENCODER'
+        else:
+            arch_type = 'SINGLE ENCODER'
+        
+        print(f"\n🎯 Training Configuration:")
+        print(f"   - Architecture: {arch_type}")
+        print(f"   - JEPA Weight: {self.jepa_weight}")
+        print(f"   - Batch Size: {self.args.batch_size}")
+        print(f"   - Learning Rate: {self.args.learning_rate}")
+        print(f"   - Train Steps per Epoch: {train_steps}\n")
+
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
@@ -128,26 +148,32 @@ class Exp_JEPA_VTS_Classification(Exp_Basic):
                 model_outputs = self.model(batch_x, padding_mask, None, None)
                 
                 if isinstance(model_outputs, tuple) and len(model_outputs) == 3:
-                    # Single encoder: (class_logits, student_encoding, predicted_teacher_encoding)
+                    # Single encoder or DINO Direct: (class_logits, student_encoding, predicted_teacher_encoding)
                     class_logits, student_encoding, predicted_teacher_encoding = model_outputs
                     
-                    # Get teacher encoding for JEPA loss
-                    with torch.no_grad():
-                        teacher_encoding = self.model.module.teacher(batch_x) if hasattr(self.model, 'module') else self.model.teacher(batch_x)
-                    
-                    # JEPA loss
-                    jepa_loss = F.mse_loss(predicted_teacher_encoding, teacher_encoding)
+                    if predicted_teacher_encoding is None:
+                        # DINO Direct mode - no JEPA loss
+                        jepa_loss = torch.tensor(0.0, device=self.device)
+                    else:
+                        # Get teacher encoding for JEPA loss
+                        with torch.no_grad():
+                            teacher_encoding = self.model.module.teacher(batch_x) if hasattr(self.model, 'module') else self.model.teacher(batch_x)
+                        # JEPA loss
+                        jepa_loss = F.mse_loss(predicted_teacher_encoding, teacher_encoding)
                     
                 elif isinstance(model_outputs, tuple) and len(model_outputs) == 2:
                     # Dual encoder: (class_logits, predicted_teacher_encoding)
                     class_logits, predicted_teacher_encoding = model_outputs
                     
-                    # Get teacher encoding for JEPA loss
-                    with torch.no_grad():
-                        teacher_encoding = self.model.module.teacher(batch_x) if hasattr(self.model, 'module') else self.model.teacher(batch_x)
-                    
-                    # JEPA loss
-                    jepa_loss = F.mse_loss(predicted_teacher_encoding, teacher_encoding)
+                    if predicted_teacher_encoding is None:
+                        # DINO Direct mode - no JEPA loss
+                        jepa_loss = torch.tensor(0.0, device=self.device)
+                    else:
+                        # Get teacher encoding for JEPA loss
+                        with torch.no_grad():
+                            teacher_encoding = self.model.module.teacher(batch_x) if hasattr(self.model, 'module') else self.model.teacher(batch_x)
+                        # JEPA loss
+                        jepa_loss = F.mse_loss(predicted_teacher_encoding, teacher_encoding)
                 else:
                     # No JEPA output (shouldn't happen in training)
                     class_logits = model_outputs
