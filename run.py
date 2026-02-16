@@ -153,12 +153,16 @@ if __name__ == '__main__':
     parser.add_argument('--use_dual_encoder', action='store_true', default=False,
                     help='Use dual encoder architecture (one for prediction, one for JEPA)')
     parser.add_argument('--fusion_type', type=str, default='mlp',
-                        choices=['add', 'weighted', 'mlp','transformer'],
+                        choices=['add', 'weighted', 'mlp'],
                         help='How to fuse dual encoders: add, weighted, or mlp')
     parser.add_argument('--vit_model', type=str, default='vit_base_patch16_224',
                     help='Vision Transformer model for teacher encoder')
-    parser.add_argument('--learned_loss_weights', action='store_true', default=False,
-                    help='Use uncertainty-based learnable loss weights')
+    parser.add_argument('--dino_direct', action='store_true', default=False,
+                    help='Use DINO embeddings directly (concat with student) without JEPA loss')
+    parser.add_argument('--dino_fusion', action='store_true', default=False,
+                    help='Fuse student encoding with DINO embedding (DINO as virtual second encoder)')
+    parser.add_argument('--dual_encoder_only', action='store_true', default=False,
+                    help='Dual encoder fusion only (no DINO, no teacher, no JEPA loss)')
 
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
