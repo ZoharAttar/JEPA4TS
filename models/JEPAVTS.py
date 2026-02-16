@@ -154,9 +154,9 @@ class JEPAPredictor(nn.Module):
 
 class EncodingFusion(nn.Module):
     """
-    Fuses two encoder outputs using MLP, Transformer, or simple operations
+    Fuses two encoder outputs using MLP
     """
-    def __init__(self, d_model, fusion_type='mlp', hidden_factor=2, n_heads=8):
+    def __init__(self, d_model, fusion_type='mlp', hidden_factor=2):
         super().__init__()
         self.fusion_type = fusion_type
         
@@ -168,21 +168,6 @@ class EncodingFusion(nn.Module):
                 nn.Dropout(0.1),
                 nn.Linear(d_model * hidden_factor, d_model)
             )
-        elif fusion_type == 'transformer':
-            # Project concatenated input to d_model
-            self.input_proj = nn.Linear(d_model * 2, d_model)
-            
-            # Transformer encoder with 2 layers
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=d_model * hidden_factor,
-                dropout=0.1,
-                activation='gelu',
-                batch_first=True
-            )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-            
         elif fusion_type == 'weighted':
             self.alpha = nn.Parameter(torch.tensor(0.5))
         elif fusion_type == 'add':
@@ -204,38 +189,20 @@ class EncodingFusion(nn.Module):
         elif self.fusion_type == 'mlp':
             # Handle both 3D and 4D inputs
             if enc1.dim() == 3:
-                concat = torch.cat([enc1, enc2], dim=-1)
+                # 3D input: [bs, seq_len, d_model] (TimesNet)
+                concat = torch.cat([enc1, enc2], dim=-1)  # [bs, seq_len, d_model*2]
                 bs, seq_len, d_model_2 = concat.shape
                 concat_flat = concat.reshape(-1, d_model_2)
                 fused_flat = self.fusion(concat_flat)
                 fused = fused_flat.reshape(bs, seq_len, -1)
                 return fused
             else:
-                concat = torch.cat([enc1, enc2], dim=2)
+                # 4D input: [bs, nvars, d_model, patch_num] (PatchTST)
+                concat = torch.cat([enc1, enc2], dim=2)  # [bs, nvars, d_model*2, patch_num]
                 bs, nvars, d_model_2, patch_num = concat.shape
                 concat_flat = concat.permute(0, 1, 3, 2).reshape(-1, d_model_2)
                 fused_flat = self.fusion(concat_flat)
                 fused = fused_flat.reshape(bs, nvars, patch_num, -1).permute(0, 1, 3, 2)
-                return fused
-        
-        elif self.fusion_type == 'transformer':
-            if enc1.dim() == 3:
-                # 3D: [bs, seq_len, d_model]
-                concat = torch.cat([enc1, enc2], dim=-1)  # [bs, seq_len, d_model*2]
-                projected = self.input_proj(concat)        # [bs, seq_len, d_model]
-                fused = self.transformer(projected)        # [bs, seq_len, d_model]
-                return fused
-            else:
-                # 4D: [bs, nvars, d_model, patch_num]
-                bs, nvars, d_model, patch_num = enc1.shape
-                # Reshape to [bs * nvars, patch_num, d_model] for transformer
-                enc1_3d = enc1.permute(0, 1, 3, 2).reshape(bs * nvars, patch_num, d_model)
-                enc2_3d = enc2.permute(0, 1, 3, 2).reshape(bs * nvars, patch_num, d_model)
-                concat = torch.cat([enc1_3d, enc2_3d], dim=-1)  # [bs*nvars, patch_num, d_model*2]
-                projected = self.input_proj(concat)              # [bs*nvars, patch_num, d_model]
-                fused = self.transformer(projected)              # [bs*nvars, patch_num, d_model]
-                # Reshape back to 4D
-                fused = fused.reshape(bs, nvars, patch_num, d_model).permute(0, 1, 3, 2)
                 return fused
 
 
@@ -257,40 +224,69 @@ class Model(nn.Module):
 
         # Determine which architecture to use
         self.use_dual_encoder = getattr(configs, 'use_dual_encoder', False)
+        self.dino_direct = getattr(configs, 'dino_direct', False)
+        self.dino_fusion = getattr(configs, 'dino_fusion', False)
+        self.dual_encoder_only = getattr(configs, 'dual_encoder_only', False)
         
         print("\n" + "="*50)
         print("Initializing JEPAVTS Model")
-        if self.use_dual_encoder:
+        if self.dual_encoder_only:
+            print("Architecture: DUAL ENCODER ONLY (No DINO, No Teacher, No JEPA) 🔄")
+        elif self.dino_fusion:
+            print("Architecture: DINO FUSION (Student ⊕ DINO → Fusion) 🔗")
+        elif self.dino_direct:
+            print("Architecture: DINO DIRECT (Student + DINO concat) 🎯")
+        elif self.use_dual_encoder:
             print("Architecture: DUAL ENCODER 🔀")
         else:
             print("Architecture: SINGLE ENCODER →")
         print("="*50)
         
-        print("\n" + "="*50)
-        print("Initializing JEPAVTS Model")
-        print("="*50)
-        
         # Get student model name
         student_model_name = getattr(configs, 'student_model', 'PatchTST')
         
-        # Teacher: VisionTS (frozen)
-        print(f"\n📊 Loading teacher vision encoder...")
-        self.data = getattr(configs, 'data')
-        self.teacher = VisionTSTeacher(dataset_name=self.data)
-        self.teacher_dim = self.teacher.hidden_size
-        print(f"✅ Teacher dimension: {self.teacher_dim}")
+        # Teacher: VisionTS (frozen) - skip for dual_encoder_only mode
+        if not self.dual_encoder_only:
+            print(f"\n📊 Loading teacher vision encoder...")
+            self.data = getattr(configs, 'data')
+            self.teacher = VisionTSTeacher(dataset_name=self.data)
+            self.teacher_dim = self.teacher.hidden_size
+            print(f"✅ Teacher dimension: {self.teacher_dim}")
+        else:
+            print(f"\n📊 Skipping teacher (dual_encoder_only mode)")
+            self.teacher = None
+            self.teacher_dim = 768  # Default, not used
         
         # Student: Time Series Encoder (trainable)
         print(f"\n🎓 Building student model: {student_model_name}")
         self.student = self._build_student_model(student_model_name, configs)
         
-        if self.use_dual_encoder:
+        if self.use_dual_encoder or self.dual_encoder_only:
             self.student1 = self._build_student_model(student_model_name, configs)
             self.student2 = self._build_student_model(student_model_name, configs)
 
             self.encoder_fusion = EncodingFusion(d_model=configs.d_model,
                                             fusion_type=getattr(configs, 'fusion_type', 'mlp')  # mlp, weighted, or add
                                         )
+            print(f"✅ Dual Encoder Fusion: {getattr(configs, 'fusion_type', 'mlp')}")
+        
+        # DINO Direct/Fusion modes: project DINO to student dim
+        if self.dino_direct or self.dino_fusion:
+            self.dino_projector = nn.Sequential(
+                nn.Linear(768, configs.d_model),  # 768 = DINO dim
+                nn.LayerNorm(configs.d_model),
+                nn.GELU(),
+            )
+            print(f"✅ DINO Projector: 768 -> {configs.d_model}")
+        
+        # DINO Fusion: also needs the fusion module
+        if self.dino_fusion:
+            self.dino_encoder_fusion = EncodingFusion(
+                d_model=configs.d_model,
+                fusion_type=getattr(configs, 'fusion_type', 'mlp')
+            )
+            print(f"✅ DINO-Student Fusion: {getattr(configs, 'fusion_type', 'mlp')}")
+        
         self.student_dim = configs.d_model
         print(f"✅ Student dimension: {self.student_dim}")
 
@@ -318,15 +314,19 @@ class Model(nn.Module):
 
         print(f"✅ Encoding type: {self.encoding_type}")
 
-        # JEPA Predictor (trainable)
-        print(f"\n🔗 Building JEPA predictor...")
-        self.predictor = JEPAPredictor(
-                student_dim=configs.d_model,
-                teacher_dim=self.teacher_dim,
-                hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
-                input_shape=predictor_input_shape
-            )
-        print(f"✅ JEPA predictor: {self.student_dim} -> {self.teacher_dim}")
+        # JEPA Predictor (trainable) - skip for dual_encoder_only mode
+        if not self.dual_encoder_only:
+            print(f"\n🔗 Building JEPA predictor...")
+            self.predictor = JEPAPredictor(
+                    student_dim=configs.d_model,
+                    teacher_dim=self.teacher_dim,
+                    hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
+                    input_shape=predictor_input_shape
+                )
+            print(f"✅ JEPA predictor: {self.student_dim} -> {self.teacher_dim}")
+        else:
+            print(f"\n🔗 Skipping JEPA predictor (dual_encoder_only mode)")
+            self.predictor = None
         
         # Store patch_num for classification head
         self.patch_num = patch_num if patch_num is not None else 1
@@ -349,24 +349,30 @@ class Model(nn.Module):
             else:
                 flatten_dim = configs.d_model
             
-            self.classification_head = nn.Sequential(
-                nn.Flatten(start_dim=1),
-                nn.Linear(flatten_dim, configs.d_model),
-                nn.LayerNorm(configs.d_model),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(configs.d_model, self.num_classes)
-            )
-            print(f"✅ Classification head: {flatten_dim} -> {self.num_classes} classes")
+            if self.dino_direct:
+                # DINO Direct mode: concat student encoding + DINO embedding
+                # DINO embedding is 768-dim
+                concat_dim = flatten_dim + self.teacher_dim
+                self.classification_head = nn.Sequential(
+                    nn.Flatten(start_dim=1),
+                    nn.Linear(concat_dim, configs.d_model * 2),
+                    nn.LayerNorm(configs.d_model * 2),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(configs.d_model * 2, self.num_classes)
+                )
+                print(f"✅ Classification head (DINO Direct): {flatten_dim} + {self.teacher_dim} -> {self.num_classes} classes")
+            else:
+                self.classification_head = nn.Sequential(
+                    nn.Flatten(start_dim=1),
+                    nn.Linear(flatten_dim, configs.d_model),
+                    nn.LayerNorm(configs.d_model),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(configs.d_model, self.num_classes)
+                )
+                print(f"✅ Classification head: {flatten_dim} -> {self.num_classes} classes")
         
-        # Learnable loss weights (uncertainty-based)
-        self.use_learned_loss_weights = getattr(configs, 'learned_loss_weights', False)
-        if self.use_learned_loss_weights:
-            # Initialize log-variance parameters (start with equal weighting ~0.5 each)
-            self.w_pred = nn.Parameter(torch.tensor([0.0]))  # log(σ²) for prediction loss
-            self.w_jepa = nn.Parameter(torch.tensor([0.0]))  # log(σ²) for JEPA loss
-            print(f"✅ Using learned loss weights (uncertainty-based)")
-
         print("\n" + "="*50)
         print("JEPAVTS Model Initialized Successfully!")
         print("="*50 + "\n")
@@ -399,28 +405,6 @@ class Model(nn.Module):
             raise NotImplementedError(f"Student model {model_name} not found")
         
         return Exp_Basic.MODEL_DICT[model_name].Model(configs)
-
-    def compute_weighted_loss(self, pred_loss, jepa_loss):
-      """
-      Uncertainty-based multi-task loss weighting.
-      L = l_pred * exp(-w_pred) + w_pred + l_jepa * exp(-w_jepa) + w_jepa
-      
-      This automatically learns the optimal balance between losses.
-      """
-      if self.use_learned_loss_weights:
-          weighted_pred = pred_loss * torch.exp(-self.w_pred) + self.w_pred
-          weighted_jepa = jepa_loss * torch.exp(-self.w_jepa) + self.w_jepa
-          total_loss = weighted_pred + weighted_jepa
-          
-          # Return individual components for logging
-          return total_loss, {
-              'pred_weight': torch.exp(-self.w_pred).item(),
-              'jepa_weight': torch.exp(-self.w_jepa).item(),
-              'w_pred': self.w_pred.item(),
-              'w_jepa': self.w_jepa.item()
-          }
-      else:
-          return None, None
     
     def teacher_forward(self, x_enc):
         """
@@ -449,6 +433,79 @@ class Model(nn.Module):
         
         return forecast_output
 
+    def student_forward_dino_direct(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
+        """
+        DINO Direct for forecasting: concat student encoding with DINO embedding
+        Then project to forecast. NO JEPA loss.
+        """
+        # Get student encoding
+        student_encoding, means, stdev = self.student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        
+        # Get DINO embedding
+        with torch.no_grad():
+            dino_embedding = self.teacher(x_enc)  # [B, 768]
+        
+        # For forecasting with dino_direct, we add DINO info to each position
+        # Project DINO to student dimension and add to encoding
+        dino_projected = self.dino_projector(dino_embedding)  # [B, d_model]
+        
+        # Expand DINO to match student encoding shape and add
+        if student_encoding.dim() == 4:
+            # PatchTST: [B, nvars, d_model, patch_num]
+            bs, nvars, d_model, patch_num = student_encoding.shape
+            dino_expanded = dino_projected.unsqueeze(1).unsqueeze(-1).expand(-1, nvars, -1, patch_num)
+        else:
+            # TimesNet: [B, T, d_model]
+            bs, seq_len, d_model = student_encoding.shape
+            dino_expanded = dino_projected.unsqueeze(1).expand(-1, seq_len, -1)
+        
+        # Simple addition (concat in feature space would change dimensions)
+        combined_encoding = student_encoding + dino_expanded
+        
+        # Decode forecast
+        forecast_output = self.student.forecast_decode(combined_encoding, means, stdev)
+        
+        if return_all:
+            return forecast_output, None, None  # No JEPA loss
+        
+        return forecast_output
+
+    def student_forward_dino_fusion(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
+        """
+        DINO Fusion for forecasting: fuse student encoding with projected DINO
+        NO JEPA loss
+        """
+        # Get student encoding
+        student_encoding, means, stdev = self.student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        
+        # Get DINO embedding
+        with torch.no_grad():
+            dino_embedding = self.teacher(x_enc)  # [B, 768]
+        
+        # Project DINO to student dimension
+        dino_projected = self.dino_projector(dino_embedding)  # [B, d_model]
+        
+        # Expand DINO to match student encoding shape
+        if student_encoding.dim() == 4:
+            # PatchTST: [B, nvars, d_model, patch_num]
+            bs, nvars, d_model, patch_num = student_encoding.shape
+            dino_expanded = dino_projected.unsqueeze(1).unsqueeze(-1).expand(-1, nvars, -1, patch_num)
+        else:
+            # TimesNet: [B, T, d_model]
+            bs, seq_len, d_model = student_encoding.shape
+            dino_expanded = dino_projected.unsqueeze(1).expand(-1, seq_len, -1)
+        
+        # Fuse student + DINO
+        fused_encoding = self.dino_encoder_fusion(student_encoding, dino_expanded)
+        
+        # Decode forecast
+        forecast_output = self.student.forecast_decode(fused_encoding, means, stdev)
+        
+        if return_all:
+            return forecast_output, None, None  # No JEPA loss
+        
+        return forecast_output
+
     def student_forward_dual_encoder(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
         """
         Student forward pass
@@ -465,6 +522,27 @@ class Model(nn.Module):
 
         if return_all:
             return forecast_output, predicted_teacher_encoding
+        
+        return forecast_output
+
+    def student_forward_dual_encoder_only(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
+        """
+        Dual encoder fusion ONLY - no DINO, no teacher, no JEPA loss
+        Two PatchTST encoders fused together, task loss only
+        """
+        # Get encodings from both students
+        student_encoding1, means1, stdev1 = self.student1.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        student_encoding2, means2, stdev2 = self.student2.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        
+        # Fuse encodings
+        combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
+        
+        # Decode forecast
+        forecast_output = self.student1.forecast_decode(combined_encoding, means1, stdev1)
+
+        if return_all:
+            # Return None for predicted_teacher_encoding to indicate no JEPA loss
+            return forecast_output, None, None
         
         return forecast_output
     
@@ -484,6 +562,69 @@ class Model(nn.Module):
             # Get JEPA prediction for teacher alignment
             predicted_teacher_encoding = self.predictor(student_encoding)
             return class_logits, student_encoding, predicted_teacher_encoding
+        
+        return class_logits
+
+    def classification_forward_dino_direct(self, x_enc, padding_mask=None, return_all=False):
+        """
+        DINO Direct mode: concatenate student encoding with DINO embedding
+        NO JEPA loss - DINO embedding used directly
+        """
+        # Get student encoding
+        student_encoding = self.student.encode(x_enc)  # [B, T, d_model]
+        
+        # Get DINO embedding directly from teacher (no JEPA predictor)
+        with torch.no_grad():
+            dino_embedding = self.teacher(x_enc)  # [B, 768]
+        
+        # Flatten student encoding
+        student_flat = student_encoding.reshape(student_encoding.shape[0], -1)  # [B, T*d_model]
+        
+        # Concatenate student + DINO
+        concat_features = torch.cat([student_flat, dino_embedding], dim=-1)  # [B, T*d_model + 768]
+        
+        # Classification (head expects already flattened input for dino_direct)
+        # But our head has Flatten as first layer, so we need to add dummy dim
+        concat_features = concat_features.unsqueeze(1)  # [B, 1, concat_dim]
+        class_logits = self.classification_head(concat_features)
+        
+        if return_all and self.training:
+            # No JEPA loss in dino_direct mode, return None for compatibility
+            return class_logits, None, None
+        
+        return class_logits
+
+    def classification_forward_dino_fusion(self, x_enc, padding_mask=None, return_all=False):
+        """
+        DINO Fusion mode: fuse student encoding with projected DINO embedding
+        Uses EncodingFusion to combine student and DINO (DINO as virtual second encoder)
+        NO JEPA loss
+        """
+        # Get student encoding
+        student_encoding = self.student.encode(x_enc)  # [B, T, d_model]
+        
+        # Get DINO embedding
+        with torch.no_grad():
+            dino_embedding = self.teacher(x_enc)  # [B, 768]
+        
+        # Project DINO to student dimension
+        dino_projected = self.dino_projector(dino_embedding)  # [B, d_model]
+        
+        # Expand DINO to match student encoding shape
+        # student_encoding: [B, T, d_model]
+        # dino_projected: [B, d_model] -> [B, T, d_model] (broadcast across time)
+        batch_size, seq_len, d_model = student_encoding.shape
+        dino_expanded = dino_projected.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, d_model]
+        
+        # Fuse student encoding with DINO (using EncodingFusion)
+        fused_encoding = self.dino_encoder_fusion(student_encoding, dino_expanded)  # [B, T, d_model]
+        
+        # Classification output
+        class_logits = self.classification_head(fused_encoding)
+        
+        if return_all and self.training:
+            # No JEPA loss in dino_fusion mode
+            return class_logits, None, None
         
         return class_logits
     
@@ -508,6 +649,27 @@ class Model(nn.Module):
             return class_logits, predicted_teacher_encoding
         
         return class_logits
+
+    def classification_forward_dual_encoder_only(self, x_enc, padding_mask=None, return_all=False):
+        """
+        Dual encoder fusion ONLY for classification - no DINO, no teacher, no JEPA loss
+        Two PatchTST encoders fused together, task loss only
+        """
+        # Get encodings from both students
+        student_encoding1 = self.student1.encode(x_enc)
+        student_encoding2 = self.student2.encode(x_enc)
+        
+        # Fuse encodings
+        combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
+        
+        # Classification output
+        class_logits = self.classification_head(combined_encoding)
+        
+        if return_all and self.training:
+            # Return None to indicate no JEPA loss
+            return class_logits, None, None
+        
+        return class_logits
     
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         """
@@ -527,23 +689,64 @@ class Model(nn.Module):
         # Classification task
         if self.task_name == 'classification':
             padding_mask = x_mark_enc  # In classification, x_mark_enc is used as padding_mask
-            if self.use_dual_encoder:
+            
+            # Dual Encoder Only mode (no DINO, no teacher, no JEPA loss)
+            if self.dual_encoder_only:
+                if self.training:
+                    return self.classification_forward_dual_encoder_only(x_enc, padding_mask, return_all=True)
+                else:
+                    return self.classification_forward_dual_encoder_only(x_enc, padding_mask, return_all=False)
+            # DINO Fusion mode (Student ⊕ DINO → Fusion, no JEPA loss)
+            elif self.dino_fusion:
+                if self.training:
+                    return self.classification_forward_dino_fusion(x_enc, padding_mask, return_all=True)
+                else:
+                    return self.classification_forward_dino_fusion(x_enc, padding_mask, return_all=False)
+            # DINO Direct mode (concat, no JEPA loss)
+            elif self.dino_direct:
+                if self.training:
+                    return self.classification_forward_dino_direct(x_enc, padding_mask, return_all=True)
+                else:
+                    return self.classification_forward_dino_direct(x_enc, padding_mask, return_all=False)
+            # Dual Encoder mode (with JEPA loss)
+            elif self.use_dual_encoder:
                 if self.training:
                     return self.classification_forward_dual_encoder(x_enc, padding_mask, return_all=True)
                 else:
                     return self.classification_forward_dual_encoder(x_enc, padding_mask, return_all=False)
+            # Single Encoder mode (with JEPA loss)
             else:
                 if self.training:
                     return self.classification_forward(x_enc, padding_mask, return_all=True)
                 else:
                     return self.classification_forward(x_enc, padding_mask, return_all=False)
         
-        # Forecasting task (existing code)
-        if self.use_dual_encoder:
+        # Forecasting task
+        # Dual Encoder Only mode (no DINO, no teacher, no JEPA loss)
+        if self.dual_encoder_only:
+            if self.training:
+                return self.student_forward_dual_encoder_only(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
+            else:
+                return self.student_forward_dual_encoder_only(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False)
+        # DINO Direct mode (student + DINO add, no JEPA loss)
+        elif self.dino_direct:
+            if self.training:
+                return self.student_forward_dino_direct(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
+            else:
+                return self.student_forward_dino_direct(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False)
+        # DINO Fusion mode (student ⊕ DINO fusion, no JEPA loss)
+        elif self.dino_fusion:
+            if self.training:
+                return self.student_forward_dino_fusion(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
+            else:
+                return self.student_forward_dino_fusion(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False)
+        # Dual Encoder mode (with JEPA loss)
+        elif self.use_dual_encoder:
             if self.training:
                 return self.student_forward_dual_encoder(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
             else:
                 return self.student_forward_dual_encoder(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False)
+        # Single Encoder mode (with JEPA loss)
         else:
             if self.training:
                 return self.student_forward(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
