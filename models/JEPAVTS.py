@@ -12,18 +12,30 @@ class VisionTSTeacher(nn.Module):
     """
     Loads pre-computed DINO embeddings from cache.
     Works with ANY batch size since each sample is cached individually by hash.
+    
+    Args:
+        dataset_name: e.g. "ETTh2"
+        hidden_size: DINO embedding dimension (768 for dinov2-base)
+        rendering_method: e.g. "RP", "GAF". When set, cache_dir becomes
+                          dino_embeddings_{dataset_name}_{rendering_method}.
+                          When None, uses legacy path dino_embeddings_{dataset_name}.
     """
     
-    def __init__(self, dataset_name="ETTh1", hidden_size=768):
+    def __init__(self, dataset_name="ETTh1", hidden_size=768, rendering_method=None):
         super().__init__()
-        self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}"
+        self.rendering_method = rendering_method
+        if rendering_method:
+            self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}_{rendering_method}"
+        else:
+            self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}"
         self.hidden_size = hidden_size
         
         if not os.path.exists(self.cache_dir):
             raise ValueError(f"❌ Cache not found: {self.cache_dir}\n   Run precompute_embeddings.py first!")
         
         n_cached = len([f for f in os.listdir(self.cache_dir) if f.endswith('.npy')])
-        print(f"✅ VisionTSTeacher: Loading from cache")
+        tag = f" [{rendering_method}]" if rendering_method else ""
+        print(f"✅ VisionTSTeacher{tag}: Loading from cache")
         print(f"✅ Cache dir: {self.cache_dir}")
         print(f"✅ Cached embeddings: {n_cached}")
         print(f"✅ Teacher hidden_size: {self.hidden_size}")
@@ -273,24 +285,62 @@ class Model(nn.Module):
         # Get student model name
         student_model_name = getattr(configs, 'student_model', 'PatchTST')
         
-        # Teacher: VisionTS (frozen)
+        # Teacher(s): VisionTS (frozen) - supports multi-rendering
         print(f"\n📊 Loading teacher vision encoder...")
         self.data = getattr(configs, 'data')
-        self.teacher = VisionTSTeacher(dataset_name=self.data)
-        self.teacher_dim = self.teacher.hidden_size
+        self.rendering_methods = getattr(configs, 'rendering_methods', None)
+        
+        if self.rendering_methods and len(self.rendering_methods) > 0:
+            # Multi-rendering mode: one teacher per rendering method
+            self.multi_rendering = True
+            self.num_renderings = len(self.rendering_methods)
+            self.teachers = nn.ModuleList([
+                VisionTSTeacher(dataset_name=self.data, rendering_method=method)
+                for method in self.rendering_methods
+            ])
+            self.teacher_dim = self.teachers[0].hidden_size
+            
+            self.multi_rendering_alpha_mode = getattr(configs, 'multi_rendering_alpha_mode', 'same')
+            self.per_method_alphas = getattr(configs, 'per_method_alphas', None)
+            
+            print(f"✅ Multi-rendering mode: {self.rendering_methods}")
+            print(f"✅ Alpha mode: {self.multi_rendering_alpha_mode}")
+            if self.multi_rendering_alpha_mode == 'per_method' and self.per_method_alphas:
+                print(f"✅ Per-method alphas: {self.per_method_alphas}")
+        else:
+            # Single rendering mode (backward compatible)
+            self.multi_rendering = False
+            self.num_renderings = 1
+            self.teacher = VisionTSTeacher(dataset_name=self.data)
+            self.teacher_dim = self.teacher.hidden_size
+        
         print(f"✅ Teacher dimension: {self.teacher_dim}")
         
         # Student: Time Series Encoder (trainable)
-        print(f"\n🎓 Building student model: {student_model_name}")
-        self.student = self._build_student_model(student_model_name, configs)
+        self.use_multi_encoder = (
+            getattr(configs, 'multi_encoder', False) and self.multi_rendering
+        )
         
-        if self.use_dual_encoder:
-            self.student1 = self._build_student_model(student_model_name, configs)
-            self.student2 = self._build_student_model(student_model_name, configs)
+        if self.use_multi_encoder:
+            # One student encoder per rendering method
+            print(f"\n🎓 Building {self.num_renderings} student models (one per rendering)...")
+            self.students_multi = nn.ModuleList([
+                self._build_student_model(student_model_name, configs)
+                for _ in self.rendering_methods
+            ])
+            self.student = self.students_multi[0]  # reference for shape detection & decode
+            for method in self.rendering_methods:
+                print(f"✅ Student [{method}]: {student_model_name}")
+        else:
+            print(f"\n🎓 Building student model: {student_model_name}")
+            self.student = self._build_student_model(student_model_name, configs)
+            
+            if self.use_dual_encoder:
+                self.student1 = self._build_student_model(student_model_name, configs)
+                self.student2 = self._build_student_model(student_model_name, configs)
 
-            self.encoder_fusion = EncodingFusion(d_model=configs.d_model,
-                                            fusion_type=getattr(configs, 'fusion_type', 'mlp')  # mlp, weighted, or add
-                                        )
+                self.encoder_fusion = EncodingFusion(d_model=configs.d_model,
+                                                fusion_type=getattr(configs, 'fusion_type', 'mlp'))
         self.student_dim = configs.d_model
         print(f"✅ Student dimension: {self.student_dim}")
 
@@ -318,15 +368,39 @@ class Model(nn.Module):
 
         print(f"✅ Encoding type: {self.encoding_type}")
 
-        # JEPA Predictor (trainable)
-        print(f"\n🔗 Building JEPA predictor...")
-        self.predictor = JEPAPredictor(
-                student_dim=configs.d_model,
-                teacher_dim=self.teacher_dim,
-                hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
-                input_shape=predictor_input_shape
-            )
-        print(f"✅ JEPA predictor: {self.student_dim} -> {self.teacher_dim}")
+        # JEPA Predictor(s) (trainable)
+        # multi_predictor and multi_encoder are independent:
+        #   --multi_predictor              → 1 student, k predictors (option 2)
+        #   --multi_encoder --multi_predictor → k students, k predictors (option 3)
+        #   --multi_encoder                → k students, 1 shared predictor (option 4)
+        self.use_multi_predictor = (
+            getattr(configs, 'multi_predictor', False) and self.multi_rendering
+        )
+        
+        if self.use_multi_predictor:
+            # One predictor per rendering method (separate z'_x per rendering)
+            print(f"\n🔗 Building {self.num_renderings} JEPA predictors (one per rendering)...")
+            self.predictors = nn.ModuleList([
+                JEPAPredictor(
+                    student_dim=configs.d_model,
+                    teacher_dim=self.teacher_dim,
+                    hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
+                    input_shape=predictor_input_shape
+                )
+                for _ in self.rendering_methods
+            ])
+            for method in self.rendering_methods:
+                print(f"✅ JEPA predictor [{method}]: {configs.d_model} -> {self.teacher_dim}")
+        else:
+            # Single shared predictor (original behaviour)
+            print(f"\n🔗 Building JEPA predictor...")
+            self.predictor = JEPAPredictor(
+                    student_dim=configs.d_model,
+                    teacher_dim=self.teacher_dim,
+                    hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
+                    input_shape=predictor_input_shape
+                )
+            print(f"✅ JEPA predictor: {configs.d_model} -> {self.teacher_dim}")
         
         # Store patch_num for classification head
         self.patch_num = patch_num if patch_num is not None else 1
@@ -424,13 +498,31 @@ class Model(nn.Module):
     
     def teacher_forward(self, x_enc):
         """
-        Teacher forward pass (always with no_grad)
+        Teacher forward pass (always with no_grad).
         x_enc: [batch_size, seq_len, n_vars] - raw time series
-        Returns: teacher_encoding [batch_size, teacher_dim]
+        
+        Returns:
+            - Multi-rendering mode: list of [batch_size, teacher_dim] (one per rendering)
+            - Single mode: [batch_size, teacher_dim]
         """
         with torch.no_grad():
-            teacher_encoding = self.teacher(x_enc)
-        return teacher_encoding
+            if self.multi_rendering:
+                return [teacher(x_enc) for teacher in self.teachers]
+            else:
+                return self.teacher(x_enc)
+    
+    def _predict_teacher(self, student_encoding):
+        """
+        Apply JEPA predictor(s) to student encoding.
+        
+        Returns:
+            - Multi-predictor mode: list of [batch, teacher_dim] (one z' per rendering)
+            - Single predictor mode: [batch, teacher_dim]
+        """
+        if self.use_multi_predictor:
+            return [pred(student_encoding) for pred in self.predictors]
+        else:
+            return self.predictor(student_encoding)
     
     def student_forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
         """
@@ -440,8 +532,8 @@ class Model(nn.Module):
         # Get student encoding
         student_encoding, means, stdev = self.student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         
-        # Predict teacher encoding via JEPA
-        predicted_teacher_encoding = self.predictor(student_encoding)
+        # Predict teacher encoding(s) via JEPA
+        predicted_teacher_encoding = self._predict_teacher(student_encoding)
         forecast_output = self.student.forecast_decode(student_encoding, means, stdev)
         
         if return_all:
@@ -458,13 +550,52 @@ class Model(nn.Module):
         student_encoding1, means1, stdev1 = self.student1.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         student_encoding2, means2, stdev2 = self.student2.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         
-        predicted_teacher_encoding = self.predictor(student_encoding2)
+        predicted_teacher_encoding = self._predict_teacher(student_encoding2)
 
         combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
         forecast_output = self.student1.forecast_decode(combined_encoding, means1, stdev1)
 
         if return_all:
             return forecast_output, predicted_teacher_encoding
+        
+        return forecast_output
+    
+    def student_forward_multi_encoder(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
+        """
+        Multi-encoder forward: k student encoders, fused for decode.
+        
+        Two modes controlled by use_multi_predictor:
+          - multi_predictor=True  (opt 3): predictor_i(student_encoding_i) → z'_i
+          - multi_predictor=False (opt 4): predictor(fused_encoding) → z' (shared)
+        """
+        # Each student encodes the same input independently
+        results = [
+            s.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+            for s in self.students_multi
+        ]
+        student_encodings = [r[0] for r in results]
+        
+        # Fuse student encodings (mean) for forecasting decode
+        fused_encoding = torch.stack(student_encodings, dim=0).mean(dim=0)
+        
+        # JEPA prediction(s)
+        if self.use_multi_predictor:
+            # Option 3: each predictor_i paired with student_encoding_i
+            predicted_teacher = [
+                pred(enc)
+                for pred, enc in zip(self.predictors, student_encodings)
+            ]
+        else:
+            # Option 4: shared predictor on fused encoding
+            predicted_teacher = self.predictor(fused_encoding)
+        
+        # Decode using first student's decoder and normalisation stats
+        means_0, stdev_0 = results[0][1], results[0][2]
+        forecast_output = self.students_multi[0].forecast_decode(
+            fused_encoding, means_0, stdev_0)
+        
+        if return_all:
+            return forecast_output, student_encodings, predicted_teacher
         
         return forecast_output
     
@@ -481,8 +612,8 @@ class Model(nn.Module):
         class_logits = self.classification_head(student_encoding)
         
         if return_all and self.training:
-            # Get JEPA prediction for teacher alignment
-            predicted_teacher_encoding = self.predictor(student_encoding)
+            # Get JEPA prediction(s) for teacher alignment
+            predicted_teacher_encoding = self._predict_teacher(student_encoding)
             return class_logits, student_encoding, predicted_teacher_encoding
         
         return class_logits
@@ -495,8 +626,8 @@ class Model(nn.Module):
         student_encoding1 = self.student1.encode(x_enc)
         student_encoding2 = self.student2.encode(x_enc)
         
-        # JEPA prediction from encoder2
-        predicted_teacher_encoding = self.predictor(student_encoding2)
+        # JEPA prediction(s) from encoder2
+        predicted_teacher_encoding = self._predict_teacher(student_encoding2)
         
         # Fuse encodings
         combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
@@ -506,6 +637,32 @@ class Model(nn.Module):
         
         if return_all and self.training:
             return class_logits, predicted_teacher_encoding
+        
+        return class_logits
+    
+    def classification_forward_multi_encoder(self, x_enc, padding_mask=None, return_all=False):
+        """
+        Multi-encoder classification: k students, fused for classification.
+        Shared or multi predictor controlled by use_multi_predictor.
+        """
+        student_encodings = [s.encode(x_enc) for s in self.students_multi]
+        
+        # Fuse student encodings (mean) for classification
+        fused_encoding = torch.stack(student_encodings, dim=0).mean(dim=0)
+        
+        # JEPA prediction(s)
+        if self.use_multi_predictor:
+            predicted_teacher = [
+                pred(enc)
+                for pred, enc in zip(self.predictors, student_encodings)
+            ]
+        else:
+            predicted_teacher = self.predictor(fused_encoding)
+        
+        class_logits = self.classification_head(fused_encoding)
+        
+        if return_all and self.training:
+            return class_logits, student_encodings, predicted_teacher
         
         return class_logits
     
@@ -527,25 +684,23 @@ class Model(nn.Module):
         # Classification task
         if self.task_name == 'classification':
             padding_mask = x_mark_enc  # In classification, x_mark_enc is used as padding_mask
-            if self.use_dual_encoder:
-                if self.training:
-                    return self.classification_forward_dual_encoder(x_enc, padding_mask, return_all=True)
-                else:
-                    return self.classification_forward_dual_encoder(x_enc, padding_mask, return_all=False)
+            if self.use_multi_encoder:
+                return self.classification_forward_multi_encoder(
+                    x_enc, padding_mask, return_all=self.training)
+            elif self.use_dual_encoder:
+                return self.classification_forward_dual_encoder(
+                    x_enc, padding_mask, return_all=self.training)
             else:
-                if self.training:
-                    return self.classification_forward(x_enc, padding_mask, return_all=True)
-                else:
-                    return self.classification_forward(x_enc, padding_mask, return_all=False)
+                return self.classification_forward(
+                    x_enc, padding_mask, return_all=self.training)
         
-        # Forecasting task (existing code)
-        if self.use_dual_encoder:
-            if self.training:
-                return self.student_forward_dual_encoder(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
-            else:
-                return self.student_forward_dual_encoder(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False)
+        # Forecasting task
+        if self.use_multi_encoder:
+            return self.student_forward_multi_encoder(
+                x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=self.training)
+        elif self.use_dual_encoder:
+            return self.student_forward_dual_encoder(
+                x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=self.training)
         else:
-            if self.training:
-                return self.student_forward(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=True)
-            else:
-                return self.student_forward(x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False)
+            return self.student_forward(
+                x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=self.training)
