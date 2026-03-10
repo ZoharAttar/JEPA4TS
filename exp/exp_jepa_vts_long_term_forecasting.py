@@ -39,13 +39,69 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         return nn.MSELoss()
     
     def _jepa_loss(self, predicted, target, loss_type='mse'):
-        """JEPA alignment loss"""
+        """JEPA alignment loss between predicted and a single target encoding."""
         if loss_type == 'cosine':
-            # Cosine similarity loss
             return 1 - torch.nn.functional.cosine_similarity(predicted, target, dim=-1).mean()
         else:
-            # MSE loss
             return torch.nn.functional.mse_loss(predicted, target)
+    
+    def _compute_jepa_loss_term(self, predicted, teacher_encodings, loss_type,
+                                jepa_weight, model_ref):
+        """
+        Compute the total JEPA loss term (already multiplied by alpha).
+        
+        Supports three modes:
+          1. Single rendering, single predictor: predicted=tensor, teachers=tensor
+          2. Multi-rendering, shared predictor:   predicted=tensor, teachers=list
+          3. Multi-rendering, multi-predictor:    predicted=list,   teachers=list
+             Each predictor is paired with its rendering: L2(z'_i, z_i)
+        
+        Returns:
+            jepa_loss_term: scalar loss (alpha-weighted sum of individual losses)
+            individual_losses: list of per-rendering losses (for logging)
+        """
+        if isinstance(teacher_encodings, list):
+            # Multi-rendering mode
+            k = len(teacher_encodings)
+            
+            if isinstance(predicted, list):
+                # Multi-predictor: pair each z'_i with z_i
+                assert len(predicted) == k, (
+                    f"Number of predictors ({len(predicted)}) must match "
+                    f"number of renderings ({k})")
+                individual_losses = [
+                    self._jepa_loss(pred_i, te_i.detach(), loss_type)
+                    for pred_i, te_i in zip(predicted, teacher_encodings)
+                ]
+            else:
+                # Shared predictor: same z' compared to every z_i
+                individual_losses = [
+                    self._jepa_loss(predicted, te.detach(), loss_type)
+                    for te in teacher_encodings
+                ]
+            
+            alpha_mode = model_ref.multi_rendering_alpha_mode
+            
+            if alpha_mode == 'divided':
+                jepa_loss_term = (jepa_weight / k) * sum(individual_losses)
+            elif alpha_mode == 'per_method':
+                per_alphas = model_ref.per_method_alphas
+                if per_alphas is None or len(per_alphas) != k:
+                    raise ValueError(
+                        f"per_method_alphas must have {k} values, got {per_alphas}")
+                jepa_loss_term = sum(
+                    a * l for a, l in zip(per_alphas, individual_losses))
+            else:
+                # 'same' (default)
+                jepa_loss_term = jepa_weight * sum(individual_losses)
+            
+            return jepa_loss_term, individual_losses
+        else:
+            # Single rendering mode (backward compatible)
+            if isinstance(predicted, list):
+                predicted = predicted[0]
+            single_loss = self._jepa_loss(predicted, teacher_encodings.detach(), loss_type)
+            return jepa_weight * single_loss, [single_loss]
     
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
@@ -97,9 +153,14 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         # Get model reference for architecture check
         model_ref = self.model.module if hasattr(self.model, 'module') else self.model
         arch_type = 'DUAL ENCODER' if model_ref.use_dual_encoder else 'SINGLE ENCODER'
+        rendering_info = (f"Multi-rendering {model_ref.rendering_methods} "
+                          f"(alpha_mode={model_ref.multi_rendering_alpha_mode})"
+                          if model_ref.multi_rendering
+                          else "Single rendering")
         
         print(f"\n🎯 Training Configuration:")
         print(f"   - Architecture: {arch_type}")
+        print(f"   - Rendering: {rendering_info}")
         print(f"   - JEPA Weight: {jepa_weight}")
         print(f"   - JEPA Loss Type: {jepa_loss_type}")
         print(f"   - Batch Size: {self.args.batch_size}")
@@ -131,10 +192,14 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                 # 1. Teacher forward (frozen, no grad)
                 teacher_encoding = model_ref.teacher_forward(batch_x)
                 
-                # 2. Student forward - handle both architectures
+                # 2. Student forward - handle all architectures
                 model_outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 
-                if model_ref.use_dual_encoder:
+                if model_ref.use_multi_encoder:
+                    # Multi-encoder: (predictions, student_encodings_list, predicted_list)
+                    predictions = model_outputs[0]
+                    predicted_teacher_encoding = model_outputs[2]
+                elif model_ref.use_dual_encoder:
                     # Dual encoder: (predictions, predicted_teacher_encoding)
                     predictions = model_outputs[0]
                     predicted_teacher_encoding = model_outputs[1]
@@ -150,29 +215,36 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                 true_outputs = batch_y[:, -self.args.pred_len:, f_dim:]
                 pred_loss = criterion(pred_outputs, true_outputs)
                 
-                # 4. JEPA alignment loss
-                jepa_loss = self._jepa_loss(predicted_teacher_encoding, 
-                                           teacher_encoding.detach(), 
-                                           jepa_loss_type)
+                # 4. JEPA alignment loss (handles both single & multi-rendering)
+                jepa_loss_term, individual_jepa_losses = self._compute_jepa_loss_term(
+                    predicted_teacher_encoding, teacher_encoding,
+                    jepa_loss_type, jepa_weight, model_ref)
+                jepa_loss_scalar = sum(l.item() for l in individual_jepa_losses)
                 
                 # 5. Combined loss
                 if model_ref.use_learned_loss_weights and predicted_teacher_encoding is not None:
-                    # Uncertainty-based weighting (learns weights automatically)
-                    loss, weight_info = model_ref.compute_weighted_loss(pred_loss, jepa_loss)
+                    # For learned weights, pass the raw sum (unweighted) of JEPA losses
+                    raw_jepa = sum(individual_jepa_losses)
+                    loss, weight_info = model_ref.compute_weighted_loss(pred_loss, raw_jepa)
                 else:
-                    # Fixed weighting
-                    loss = pred_loss + jepa_weight * jepa_loss
+                    loss = pred_loss + jepa_loss_term
                     weight_info = None
 
                 train_loss.append(loss.item())
                 train_pred_loss.append(pred_loss.item())
-                train_jepa_loss.append(jepa_loss.item())
+                train_jepa_loss.append(jepa_loss_scalar)
                 
                 if (i + 1) % 100 == 0:
                     print(f"\t📈 Iter: {i+1}/{train_steps}, Epoch: {epoch+1}/{self.args.train_epochs} [{arch_type}]")
                     print(f"\t   Total Loss: {loss.item():.7f}")
                     print(f"\t   Pred Loss: {pred_loss.item():.7f}")
-                    print(f"\t   JEPA Loss: {jepa_loss.item():.7f}")
+                    if model_ref.multi_rendering:
+                        for idx, (method, jl) in enumerate(
+                                zip(model_ref.rendering_methods, individual_jepa_losses)):
+                            print(f"\t   JEPA Loss [{method}]: {jl.item():.7f}")
+                        print(f"\t   JEPA Loss (combined term): {jepa_loss_term.item():.7f}")
+                    else:
+                        print(f"\t   JEPA Loss: {jepa_loss_scalar:.7f}")
                     if weight_info:
                         print(f"\t   Learned Weights: pred={weight_info['pred_weight']:.4f}, jepa={weight_info['jepa_weight']:.4f}")
                     speed = (time.time() - time_now) / iter_count
