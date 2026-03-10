@@ -159,6 +159,28 @@ if __name__ == '__main__':
                     help='Vision Transformer model for teacher encoder')
     parser.add_argument('--learned_loss_weights', action='store_true', default=False,
                     help='Use uncertainty-based learnable loss weights')
+    
+    # Multi-rendering JEPA
+    parser.add_argument('--rendering_methods', type=str, nargs='+', default=None,
+                        help='List of rendering methods for multi-rendering JEPA, e.g. --rendering_methods RP GAF. '
+                             'Expects precomputed embeddings at dino_embeddings_{data}_{method}/')
+    parser.add_argument('--multi_rendering_alpha_mode', type=str, default='same',
+                        choices=['same', 'divided', 'per_method'],
+                        help='How to weight the JEPA losses across renderings: '
+                             'same = alpha * sum(L2_i), '
+                             'divided = (alpha/k) * sum(L2_i), '
+                             'per_method = alpha_i * L2_i for each rendering')
+    parser.add_argument('--per_method_alphas', type=float, nargs='+', default=None,
+                        help='Per-rendering alpha values when --multi_rendering_alpha_mode=per_method, '
+                             'e.g. --per_method_alphas 0.5 1.0')
+    parser.add_argument('--multi_predictor', action='store_true', default=False,
+                        help='Use a separate JEPA predictor per rendering method (requires --rendering_methods). '
+                             'Each predictor produces its own z\'_x_i paired with the corresponding z_x_i.')
+    parser.add_argument('--multi_encoder', action='store_true', default=False,
+                        help='Use a separate student encoder per rendering method '
+                             '(requires --rendering_methods). Encodings are fused via mean. '
+                             'Combine with --multi_predictor for per-rendering predictors, '
+                             'or use alone for a shared predictor on the fused encoding.')
 
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
