@@ -19,15 +19,20 @@ class VisionTSTeacher(nn.Module):
         rendering_method: e.g. "RP", "GAF". When set, cache_dir becomes
                           dino_embeddings_{dataset_name}_{rendering_method}.
                           When None, uses legacy path dino_embeddings_{dataset_name}.
+        per_var: if True, loads per-variable embeddings [N, 768] per sample
+                 from cache with _pervar suffix. If False, loads averaged [768].
     """
     
-    def __init__(self, dataset_name="ETTh1", hidden_size=768, rendering_method=None):
+    def __init__(self, dataset_name="ETTh1", hidden_size=768, rendering_method=None, per_var=False):
         super().__init__()
         self.rendering_method = rendering_method
+        self.per_var = per_var
+        
+        suffix = "_pervar" if per_var else ""
         if rendering_method:
-            self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}_{rendering_method}"
+            self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}_{rendering_method}{suffix}"
         else:
-            self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}"
+            self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}{suffix}"
         self.hidden_size = hidden_size
         
         if not os.path.exists(self.cache_dir):
@@ -35,7 +40,8 @@ class VisionTSTeacher(nn.Module):
         
         n_cached = len([f for f in os.listdir(self.cache_dir) if f.endswith('.npy')])
         tag = f" [{rendering_method}]" if rendering_method else ""
-        print(f"✅ VisionTSTeacher{tag}: Loading from cache")
+        pv_tag = " [per_var]" if per_var else ""
+        print(f"✅ VisionTSTeacher{tag}{pv_tag}: Loading from cache")
         print(f"✅ Cache dir: {self.cache_dir}")
         print(f"✅ Cached embeddings: {n_cached}")
         print(f"✅ Teacher hidden_size: {self.hidden_size}")
@@ -45,8 +51,10 @@ class VisionTSTeacher(nn.Module):
     
     def forward(self, x_enc):
         """
-        x_enc: [batch, seq_len, nvars] - ANY batch size works!
-        Returns: [batch, hidden_size]
+        x_enc: [batch, seq_len, nvars]
+        Returns:
+            per_var=False: [batch, hidden_size]
+            per_var=True:  [batch, nvars, hidden_size]
         """
         batch_size = x_enc.shape[0]
         device = x_enc.device
@@ -100,48 +108,49 @@ class VisionTSTeacher(nn.Module):
 
 class JEPAPredictor(nn.Module):
     """
-    JEPA predictor: maps student encoding to teacher encoding space
-    Supports both 4D (PatchTST) and 1D (DLinear, iTransformer, etc.) inputs
+    JEPA predictor: maps student encoding to teacher encoding space.
+    Supports both 4D (PatchTST) and 1D (DLinear, iTransformer, etc.) inputs.
+    
+    When per_var=True and input_shape is provided (4D), the predictor operates
+    per-variable: each variable's [d_model, patch_num] is independently mapped
+    to [teacher_dim] using a shared MLP, producing [B, n_vars, teacher_dim].
     """
     
-    def __init__(self, student_dim, teacher_dim, hidden_dim=512, input_shape=None):
+    def __init__(self, student_dim, teacher_dim, hidden_dim=512, input_shape=None, per_var=False):
         """
         Args:
             student_dim: d_model dimension (used for 1D input)
             teacher_dim: teacher embedding dimension (e.g., 768)
             hidden_dim: hidden layer dimension for MLP
             input_shape: tuple (n_vars, d_model, patch_num) for 4D input
-                        - If provided: expects 4D input [batch, n_vars, d_model, patch_num]
-                        - If None: expects 1D input [batch, student_dim]
-        
-        Examples:
-            # For PatchTST (4D):
-            predictor = JEPAPredictor(512, 768, 512, input_shape=(7, 512, 12))
-            
-            # For DLinear/iTransformer (1D):
-            predictor = JEPAPredictor(512, 768, 512, input_shape=None)
+            per_var: if True, predict per-variable instead of flattening all vars
         """
         super().__init__()
         
         self.input_shape = input_shape
+        self.per_var = per_var
         
         if input_shape is not None:
-            # For 4D input (PatchTST, CNN-based models)
-            # Input: [batch, n_vars, d_model, patch_num]
             n_vars, d_model, patch_num = input_shape
-            flatten_dim = n_vars * d_model * patch_num
+            if per_var:
+                # Per-variable: shared MLP applied to each variable independently
+                flatten_dim = d_model * patch_num
+            else:
+                # Original: flatten all variables together
+                flatten_dim = n_vars * d_model * patch_num
             
-            self.predictor = nn.Sequential(
-                nn.Flatten(start_dim=1),  # Flatten all spatial dims
+            layers = []
+            if not per_var:
+                layers.append(nn.Flatten(start_dim=1))
+            layers.extend([
                 nn.Linear(flatten_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim, teacher_dim)
-            )
+            ])
+            self.predictor = nn.Sequential(*layers)
         else:
-            # For 1D input (DLinear, iTransformer, Transformer, etc.)
-            # Input: [batch, student_dim]
             self.predictor = nn.Sequential(
                 nn.Linear(student_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
@@ -152,16 +161,20 @@ class JEPAPredictor(nn.Module):
     
     def forward(self, student_encoding):
         """
-        Forward pass
-        
         Args:
             student_encoding: 
-                - 4D: [batch_size, n_vars, d_model, patch_num] (if input_shape was provided)
-                - 1D: [batch_size, student_dim] (if input_shape was None)
-        
+                - 4D: [B, n_vars, d_model, patch_num]
+                - 1D: [B, student_dim]
         Returns:
-            [batch_size, teacher_dim] - predicted teacher encoding
+            per_var=True  + 4D input: [B, n_vars, teacher_dim]
+            per_var=False + 4D input: [B, teacher_dim]
+            1D input:                 [B, teacher_dim]
         """
+        if self.per_var and self.input_shape is not None:
+            B, N, D, P = student_encoding.shape
+            x = student_encoding.reshape(B * N, D * P)
+            x = self.predictor(x)       # [B*N, teacher_dim]
+            return x.reshape(B, N, -1)  # [B, N, teacher_dim]
         return self.predictor(student_encoding)
 
 class EncodingFusion(nn.Module):
@@ -289,13 +302,18 @@ class Model(nn.Module):
         print(f"\n📊 Loading teacher vision encoder...")
         self.data = getattr(configs, 'data')
         self.rendering_methods = getattr(configs, 'rendering_methods', None)
+        self.per_var_teacher = getattr(configs, 'per_var_teacher', False)
+        
+        if self.per_var_teacher:
+            print("✅ Per-variable teacher mode: each variable gets its own DINO embedding")
         
         if self.rendering_methods and len(self.rendering_methods) > 0:
             # Multi-rendering mode: one teacher per rendering method
             self.multi_rendering = True
             self.num_renderings = len(self.rendering_methods)
             self.teachers = nn.ModuleList([
-                VisionTSTeacher(dataset_name=self.data, rendering_method=method)
+                VisionTSTeacher(dataset_name=self.data, rendering_method=method,
+                                per_var=self.per_var_teacher)
                 for method in self.rendering_methods
             ])
             self.teacher_dim = self.teachers[0].hidden_size
@@ -311,7 +329,8 @@ class Model(nn.Module):
             # Single rendering mode (backward compatible)
             self.multi_rendering = False
             self.num_renderings = 1
-            self.teacher = VisionTSTeacher(dataset_name=self.data)
+            self.teacher = VisionTSTeacher(dataset_name=self.data,
+                                           per_var=self.per_var_teacher)
             self.teacher_dim = self.teacher.hidden_size
         
         print(f"✅ Teacher dimension: {self.teacher_dim}")
@@ -385,7 +404,8 @@ class Model(nn.Module):
                     student_dim=configs.d_model,
                     teacher_dim=self.teacher_dim,
                     hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
-                    input_shape=predictor_input_shape
+                    input_shape=predictor_input_shape,
+                    per_var=self.per_var_teacher
                 )
                 for _ in self.rendering_methods
             ])
@@ -398,7 +418,8 @@ class Model(nn.Module):
                     student_dim=configs.d_model,
                     teacher_dim=self.teacher_dim,
                     hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
-                    input_shape=predictor_input_shape
+                    input_shape=predictor_input_shape,
+                    per_var=self.per_var_teacher
                 )
             print(f"✅ JEPA predictor: {configs.d_model} -> {self.teacher_dim}")
         
@@ -501,9 +522,9 @@ class Model(nn.Module):
         Teacher forward pass (always with no_grad).
         x_enc: [batch_size, seq_len, n_vars] - raw time series
         
-        Returns:
-            - Multi-rendering mode: list of [batch_size, teacher_dim] (one per rendering)
-            - Single mode: [batch_size, teacher_dim]
+        Returns (shape depends on per_var_teacher):
+            - per_var=False: [batch_size, teacher_dim]  (or list thereof)
+            - per_var=True:  [batch_size, n_vars, teacher_dim]  (or list thereof)
         """
         with torch.no_grad():
             if self.multi_rendering:
@@ -515,9 +536,9 @@ class Model(nn.Module):
         """
         Apply JEPA predictor(s) to student encoding.
         
-        Returns:
-            - Multi-predictor mode: list of [batch, teacher_dim] (one z' per rendering)
-            - Single predictor mode: [batch, teacher_dim]
+        Returns (shape depends on per_var_teacher):
+            - per_var=False: [batch, teacher_dim]  (or list thereof)
+            - per_var=True:  [batch, n_vars, teacher_dim]  (or list thereof)
         """
         if self.use_multi_predictor:
             return [pred(student_encoding) for pred in self.predictors]
