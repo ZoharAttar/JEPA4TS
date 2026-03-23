@@ -181,6 +181,10 @@ if __name__ == '__main__':
                              '(requires --rendering_methods). Encodings are fused via mean. '
                              'Combine with --multi_predictor for per-rendering predictors, '
                              'or use alone for a shared predictor on the fused encoding.')
+    parser.add_argument('--per_var_teacher', action='store_true', default=False,
+                        help='Use per-variable DINO teacher embeddings [B, N, 768] instead of '
+                             'averaged [B, 768]. Requires precomputed per-var embeddings '
+                             '(run precompute_embeddings_pervar.py first).')
 
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
