@@ -326,7 +326,7 @@ class Model(nn.Module):
 
         return x_enc, x_mark_enc
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+    def encode(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
 
         x_enc, x_mark_enc = self.__multi_scale_process_inputs(x_enc, x_mark_enc)
 
@@ -368,11 +368,19 @@ class Model(nn.Module):
         for i in range(self.layer):
             enc_out_list = self.pdm_blocks[i](enc_out_list)
 
+        return enc_out_list, x_list, B
+
+    def forecast_decode(self, B, enc_out_list, x_list):
         # Future Multipredictor Mixing as decoder for future
         dec_out_list = self.future_multi_mixing(B, enc_out_list, x_list)
 
         dec_out = torch.stack(dec_out_list, dim=-1).sum(-1)
         dec_out = self.normalize_layers[0](dec_out, 'denorm')
+        return dec_out
+
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        enc_out_list, x_list, B = self.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        dec_out = self.forecast_decode(B, enc_out_list, x_list)
         return dec_out
 
     def future_multi_mixing(self, B, enc_out_list, x_list):
