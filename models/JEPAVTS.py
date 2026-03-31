@@ -179,25 +179,24 @@ class JEPAPredictor(nn.Module):
 
 class EncodingFusion(nn.Module):
     """
-    Fuses two encoder outputs using MLP, Transformer, or simple operations
+    Fuses N encoder outputs using MLP, Transformer, or simple operations.
+    Supports any number of inputs (2 for dual encoder, K+1 for multi+dual, etc.)
     """
-    def __init__(self, d_model, fusion_type='mlp', hidden_factor=2, n_heads=8):
+    def __init__(self, d_model, num_inputs=2, fusion_type='mlp', hidden_factor=2, n_heads=8):
         super().__init__()
         self.fusion_type = fusion_type
+        self.num_inputs = num_inputs
         
         if fusion_type == 'mlp':
             self.fusion = nn.Sequential(
-                nn.Linear(d_model * 2, d_model * hidden_factor),
+                nn.Linear(d_model * num_inputs, d_model * hidden_factor),
                 nn.LayerNorm(d_model * hidden_factor),
                 nn.GELU(),
                 nn.Dropout(0.1),
                 nn.Linear(d_model * hidden_factor, d_model)
             )
         elif fusion_type == 'transformer':
-            # Project concatenated input to d_model
-            self.input_proj = nn.Linear(d_model * 2, d_model)
-            
-            # Transformer encoder with 2 layers
+            self.input_proj = nn.Linear(d_model * num_inputs, d_model)
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=d_model,
                 nhead=n_heads,
@@ -209,57 +208,60 @@ class EncodingFusion(nn.Module):
             self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
             
         elif fusion_type == 'weighted':
-            self.alpha = nn.Parameter(torch.tensor(0.5))
+            self.alphas = nn.Parameter(torch.ones(num_inputs) / num_inputs)
         elif fusion_type == 'add':
-            pass  # Simple addition
+            pass
     
-    def forward(self, enc1, enc2):
+    def forward(self, *encodings):
         """
-        Supports both 3D and 4D inputs:
-        - 3D (TimesNet): [bs, seq_len, d_model]
-        - 4D (PatchTST): [bs, nvars, d_model, patch_num]
+        Args: N encodings, each 3D [bs, seq_len, d_model] or 4D [bs, nvars, d_model, patch_num]
+              Can also pass a single list of encodings.
         """
+        if len(encodings) == 1 and isinstance(encodings[0], (list, tuple)):
+            encodings = encodings[0]
+        
         if self.fusion_type == 'add':
-            return enc1 + enc2
+            result = encodings[0]
+            for enc in encodings[1:]:
+                result = result + enc
+            return result
         
         elif self.fusion_type == 'weighted':
-            alpha = torch.sigmoid(self.alpha)
-            return alpha * enc1 + (1 - alpha) * enc2
+            weights = torch.softmax(self.alphas, dim=0)
+            result = weights[0] * encodings[0]
+            for i, enc in enumerate(encodings[1:], 1):
+                result = result + weights[i] * enc
+            return result
         
         elif self.fusion_type == 'mlp':
-            # Handle both 3D and 4D inputs
-            if enc1.dim() == 3:
-                concat = torch.cat([enc1, enc2], dim=-1)
-                bs, seq_len, d_model_2 = concat.shape
-                concat_flat = concat.reshape(-1, d_model_2)
+            if encodings[0].dim() == 3:
+                concat = torch.cat(list(encodings), dim=-1)
+                bs, seq_len, cat_dim = concat.shape
+                concat_flat = concat.reshape(-1, cat_dim)
                 fused_flat = self.fusion(concat_flat)
                 fused = fused_flat.reshape(bs, seq_len, -1)
                 return fused
             else:
-                concat = torch.cat([enc1, enc2], dim=2)
-                bs, nvars, d_model_2, patch_num = concat.shape
-                concat_flat = concat.permute(0, 1, 3, 2).reshape(-1, d_model_2)
+                concat = torch.cat(list(encodings), dim=2)
+                bs, nvars, cat_dim, patch_num = concat.shape
+                concat_flat = concat.permute(0, 1, 3, 2).reshape(-1, cat_dim)
                 fused_flat = self.fusion(concat_flat)
                 fused = fused_flat.reshape(bs, nvars, patch_num, -1).permute(0, 1, 3, 2)
                 return fused
         
         elif self.fusion_type == 'transformer':
-            if enc1.dim() == 3:
-                # 3D: [bs, seq_len, d_model]
-                concat = torch.cat([enc1, enc2], dim=-1)  # [bs, seq_len, d_model*2]
-                projected = self.input_proj(concat)        # [bs, seq_len, d_model]
-                fused = self.transformer(projected)        # [bs, seq_len, d_model]
+            if encodings[0].dim() == 3:
+                concat = torch.cat(list(encodings), dim=-1)
+                projected = self.input_proj(concat)
+                fused = self.transformer(projected)
                 return fused
             else:
-                # 4D: [bs, nvars, d_model, patch_num]
-                bs, nvars, d_model, patch_num = enc1.shape
-                # Reshape to [bs * nvars, patch_num, d_model] for transformer
-                enc1_3d = enc1.permute(0, 1, 3, 2).reshape(bs * nvars, patch_num, d_model)
-                enc2_3d = enc2.permute(0, 1, 3, 2).reshape(bs * nvars, patch_num, d_model)
-                concat = torch.cat([enc1_3d, enc2_3d], dim=-1)  # [bs*nvars, patch_num, d_model*2]
-                projected = self.input_proj(concat)              # [bs*nvars, patch_num, d_model]
-                fused = self.transformer(projected)              # [bs*nvars, patch_num, d_model]
-                # Reshape back to 4D
+                bs, nvars, d_model, patch_num = encodings[0].shape
+                encs_3d = [e.permute(0, 1, 3, 2).reshape(bs * nvars, patch_num, d_model)
+                           for e in encodings]
+                concat = torch.cat(encs_3d, dim=-1)
+                projected = self.input_proj(concat)
+                fused = self.transformer(projected)
                 fused = fused.reshape(bs, nvars, patch_num, d_model).permute(0, 1, 3, 2)
                 return fused
 
@@ -339,9 +341,27 @@ class Model(nn.Module):
         self.use_multi_encoder = (
             getattr(configs, 'multi_encoder', False) and self.multi_rendering
         )
+        fusion_type = getattr(configs, 'fusion_type', 'mlp')
         
-        if self.use_multi_encoder:
-            # One student encoder per rendering method
+        if self.use_multi_encoder and self.use_dual_encoder:
+            # K JEPA encoders (one per rendering) + 1 forecast encoder
+            print(f"\n🎓 Building {self.num_renderings} JEPA student models + 1 forecast encoder...")
+            self.students_multi = nn.ModuleList([
+                self._build_student_model(student_model_name, configs)
+                for _ in self.rendering_methods
+            ])
+            self.student_forecast = self._build_student_model(student_model_name, configs)
+            self.student = self.students_multi[0]  # reference for shape detection
+            for method in self.rendering_methods:
+                print(f"✅ JEPA Student [{method}]: {student_model_name}")
+            print(f"✅ Forecast Student: {student_model_name}")
+            num_fusion_inputs = self.num_renderings + 1
+            self.encoder_fusion = EncodingFusion(
+                d_model=configs.d_model, num_inputs=num_fusion_inputs,
+                fusion_type=fusion_type)
+            print(f"✅ Fusion: {fusion_type} ({num_fusion_inputs} inputs)")
+        elif self.use_multi_encoder:
+            # K encoders (one per rendering), no separate forecast encoder
             print(f"\n🎓 Building {self.num_renderings} student models (one per rendering)...")
             self.students_multi = nn.ModuleList([
                 self._build_student_model(student_model_name, configs)
@@ -350,16 +370,19 @@ class Model(nn.Module):
             self.student = self.students_multi[0]  # reference for shape detection & decode
             for method in self.rendering_methods:
                 print(f"✅ Student [{method}]: {student_model_name}")
+        elif self.use_dual_encoder:
+            # 1 forecast encoder + 1 JEPA encoder, fused
+            print(f"\n🎓 Building dual encoder (forecast + JEPA)...")
+            self.student = self._build_student_model(student_model_name, configs)
+            self.student1 = self._build_student_model(student_model_name, configs)
+            self.student2 = self._build_student_model(student_model_name, configs)
+            self.encoder_fusion = EncodingFusion(
+                d_model=configs.d_model, num_inputs=2, fusion_type=fusion_type)
+            print(f"✅ Fusion: {fusion_type} (2 inputs)")
         else:
+            # Single encoder for everything
             print(f"\n🎓 Building student model: {student_model_name}")
             self.student = self._build_student_model(student_model_name, configs)
-            
-            if self.use_dual_encoder:
-                self.student1 = self._build_student_model(student_model_name, configs)
-                self.student2 = self._build_student_model(student_model_name, configs)
-
-                self.encoder_fusion = EncodingFusion(d_model=configs.d_model,
-                                                fusion_type=getattr(configs, 'fusion_type', 'mlp'))
         self.student_dim = configs.d_model
         print(f"✅ Student dimension: {self.student_dim}")
 
@@ -689,6 +712,68 @@ class Model(nn.Module):
         
         return forecast_output
     
+    def student_forward_multi_dual(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
+        """
+        Multi-encoder + dual encoder: K JEPA encoders (one per rendering) + 1 forecast encoder.
+        All K+1 encodings are fused for decode. JEPA encoders align with their respective teachers.
+        """
+        if self.encoding_type == '4D_timemixer':
+            # Forecast encoder
+            fc_jepa, fc_enc_list, fc_x_list, fc_B = self._timemixer_encode(
+                self.student_forecast, x_enc, x_mark_enc, x_dec, x_mark_dec)
+            # K JEPA encoders
+            tm_results = [
+                self._timemixer_encode(s, x_enc, x_mark_enc, x_dec, x_mark_dec)
+                for s in self.students_multi
+            ]
+            jepa_encodings = [r[0] for r in tm_results]
+
+            if self.use_multi_predictor:
+                predicted_teacher = [
+                    pred(enc) for pred, enc in zip(self.predictors, jepa_encodings)
+                ]
+            else:
+                fused_jepa = torch.stack(jepa_encodings, dim=0).mean(dim=0)
+                predicted_teacher = self.predictor(fused_jepa)
+
+            all_encs = [fc_jepa] + jepa_encodings
+            fused = self.encoder_fusion(all_encs)
+
+            N = self.configs.enc_in
+            T, D = fc_enc_list[0].shape[1], fc_enc_list[0].shape[2]
+            fused_finest = fused.permute(0, 1, 3, 2).reshape(fc_B * N, T, D)
+            fused_enc_list = [fused_finest] + fc_enc_list[1:]
+            forecast_output = self.student_forecast.forecast_decode(fc_B, fused_enc_list, fc_x_list)
+
+            if return_all:
+                return forecast_output, jepa_encodings, predicted_teacher
+            return forecast_output
+
+        # Non-TimeMixer path
+        fc_enc, fc_means, fc_stdev = self.student_forecast.encode(
+            x_enc, x_mark_enc, x_dec, x_mark_dec)
+        results = [
+            s.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+            for s in self.students_multi
+        ]
+        jepa_encodings = [r[0] for r in results]
+
+        if self.use_multi_predictor:
+            predicted_teacher = [
+                pred(enc) for pred, enc in zip(self.predictors, jepa_encodings)
+            ]
+        else:
+            fused_jepa = torch.stack(jepa_encodings, dim=0).mean(dim=0)
+            predicted_teacher = self.predictor(fused_jepa)
+
+        all_encs = [fc_enc] + jepa_encodings
+        fused = self.encoder_fusion(all_encs)
+        forecast_output = self.student_forecast.forecast_decode(fused, fc_means, fc_stdev)
+
+        if return_all:
+            return forecast_output, jepa_encodings, predicted_teacher
+        return forecast_output
+
     def classification_forward(self, x_enc, padding_mask=None, return_all=False):
         """
         Classification forward pass
@@ -756,6 +841,30 @@ class Model(nn.Module):
         
         return class_logits
     
+    def classification_forward_multi_dual(self, x_enc, padding_mask=None, return_all=False):
+        """
+        Multi-encoder + dual encoder classification:
+        K JEPA encoders + 1 forecast encoder, all fused for classification.
+        """
+        fc_encoding = self.student_forecast.encode(x_enc)
+        jepa_encodings = [s.encode(x_enc) for s in self.students_multi]
+
+        if self.use_multi_predictor:
+            predicted_teacher = [
+                pred(enc) for pred, enc in zip(self.predictors, jepa_encodings)
+            ]
+        else:
+            fused_jepa = torch.stack(jepa_encodings, dim=0).mean(dim=0)
+            predicted_teacher = self.predictor(fused_jepa)
+
+        all_encs = [fc_encoding] + jepa_encodings
+        fused = self.encoder_fusion(all_encs)
+        class_logits = self.classification_head(fused)
+
+        if return_all and self.training:
+            return class_logits, jepa_encodings, predicted_teacher
+        return class_logits
+
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         """
         Main forward - behavior depends on task_name, training mode and architecture
@@ -773,8 +882,11 @@ class Model(nn.Module):
         """
         # Classification task
         if self.task_name == 'classification':
-            padding_mask = x_mark_enc  # In classification, x_mark_enc is used as padding_mask
-            if self.use_multi_encoder:
+            padding_mask = x_mark_enc
+            if self.use_multi_encoder and self.use_dual_encoder:
+                return self.classification_forward_multi_dual(
+                    x_enc, padding_mask, return_all=self.training)
+            elif self.use_multi_encoder:
                 return self.classification_forward_multi_encoder(
                     x_enc, padding_mask, return_all=self.training)
             elif self.use_dual_encoder:
@@ -785,7 +897,10 @@ class Model(nn.Module):
                     x_enc, padding_mask, return_all=self.training)
         
         # Forecasting task
-        if self.use_multi_encoder:
+        if self.use_multi_encoder and self.use_dual_encoder:
+            return self.student_forward_multi_dual(
+                x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=self.training)
+        elif self.use_multi_encoder:
             return self.student_forward_multi_encoder(
                 x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=self.training)
         elif self.use_dual_encoder:
