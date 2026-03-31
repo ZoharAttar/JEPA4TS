@@ -141,7 +141,7 @@ if __name__ == '__main__':
 
     # JEPA-VTS specific arguments
     parser.add_argument('--student_model', type=str, default='PatchTST',
-                        help='Student TS model: PatchTST, TimesNet, DLinear, iTransformer, Transformer')
+                        help='Student TS model: PatchTST, TimeMixer, TimesNet, DLinear, iTransformer, Transformer')
     parser.add_argument('--jepa_weight', type=float, default=1.0,
                         help='Weight for JEPA alignment loss')
     parser.add_argument('--jepa_hidden_dim', type=int, default=512,
