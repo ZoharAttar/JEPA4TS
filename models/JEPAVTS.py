@@ -374,6 +374,16 @@ class Model(nn.Module):
             patch_num = int((configs.seq_len - patch_len) / stride + 2)
             self.encoding_type = '4D'  # [B, nvars, d_model, patch_num]
             predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
+        elif student_model_name == 'TimeMixer':
+            patch_num = None
+            if getattr(configs, 'channel_independence', 1):
+                # channel_independence=True: enc [B*N, seq_len, d_model] → [B, N, d_model, seq_len]
+                self.encoding_type = '4D_timemixer'
+                predictor_input_shape = (configs.enc_in, configs.d_model, configs.seq_len)
+            else:
+                # channel_independence=False: enc [B, seq_len, d_model] (all vars mixed)
+                self.encoding_type = '3D'
+                predictor_input_shape = (configs.seq_len, configs.d_model, 1)
         elif student_model_name == 'TimesNet':
             # TimesNet: encoding shape is [B, T, d_model]
             patch_num = None
@@ -545,15 +555,33 @@ class Model(nn.Module):
         else:
             return self.predictor(student_encoding)
     
+    def _timemixer_encode(self, student, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        """
+        Encode with TimeMixer and reshape finest-scale encoding to 4D for JEPA.
+        Returns: (jepa_encoding [B, N, d_model, seq_len], enc_out_list, x_list, B_size)
+        """
+        enc_out_list, x_list, B = student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        enc_finest = enc_out_list[0]  # [B*N, seq_len, d_model]
+        N = self.configs.enc_in
+        T, D = enc_finest.shape[1], enc_finest.shape[2]
+        jepa_encoding = enc_finest.reshape(B, N, T, D).permute(0, 1, 3, 2)  # [B, N, d_model, seq_len]
+        return jepa_encoding, enc_out_list, x_list, B
+
     def student_forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
         """
         Student forward pass
         Returns predictions and optionally encodings
         """
-        # Get student encoding
+        if self.encoding_type == '4D_timemixer':
+            jepa_encoding, enc_out_list, x_list, B = self._timemixer_encode(
+                self.student, x_enc, x_mark_enc, x_dec, x_mark_dec)
+            predicted_teacher_encoding = self._predict_teacher(jepa_encoding)
+            forecast_output = self.student.forecast_decode(B, enc_out_list, x_list)
+            if return_all:
+                return forecast_output, jepa_encoding, predicted_teacher_encoding
+            return forecast_output
+
         student_encoding, means, stdev = self.student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
-        
-        # Predict teacher encoding(s) via JEPA
         predicted_teacher_encoding = self._predict_teacher(student_encoding)
         forecast_output = self.student.forecast_decode(student_encoding, means, stdev)
         
@@ -564,10 +592,26 @@ class Model(nn.Module):
 
     def student_forward_dual_encoder(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
         """
-        Student forward pass
-        Returns predictions and optionally encodings
+        Student forward pass with dual encoders.
+        Returns predictions and optionally encodings.
         """
-        # Get student encoding
+        if self.encoding_type == '4D_timemixer':
+            jepa_enc1, enc_list1, x_list1, B1 = self._timemixer_encode(
+                self.student1, x_enc, x_mark_enc, x_dec, x_mark_dec)
+            jepa_enc2, enc_list2, x_list2, B2 = self._timemixer_encode(
+                self.student2, x_enc, x_mark_enc, x_dec, x_mark_dec)
+            predicted_teacher_encoding = self._predict_teacher(jepa_enc2)
+            combined_encoding = self.encoder_fusion(jepa_enc1, jepa_enc2)
+            # Decode using student1 with its own enc_out_list fused
+            N = self.configs.enc_in
+            T, D = enc_list1[0].shape[1], enc_list1[0].shape[2]
+            fused_finest = combined_encoding.permute(0, 1, 3, 2).reshape(B1 * N, T, D)
+            fused_enc_list = [fused_finest] + enc_list1[1:]
+            forecast_output = self.student1.forecast_decode(B1, fused_enc_list, x_list1)
+            if return_all:
+                return forecast_output, predicted_teacher_encoding
+            return forecast_output
+
         student_encoding1, means1, stdev1 = self.student1.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         student_encoding2, means2, stdev2 = self.student2.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         
@@ -589,7 +633,32 @@ class Model(nn.Module):
           - multi_predictor=True  (opt 3): predictor_i(student_encoding_i) → z'_i
           - multi_predictor=False (opt 4): predictor(fused_encoding) → z' (shared)
         """
-        # Each student encodes the same input independently
+        if self.encoding_type == '4D_timemixer':
+            tm_results = [
+                self._timemixer_encode(s, x_enc, x_mark_enc, x_dec, x_mark_dec)
+                for s in self.students_multi
+            ]
+            jepa_encodings = [r[0] for r in tm_results]
+            fused_jepa = torch.stack(jepa_encodings, dim=0).mean(dim=0)
+
+            if self.use_multi_predictor:
+                predicted_teacher = [
+                    pred(enc) for pred, enc in zip(self.predictors, jepa_encodings)
+                ]
+            else:
+                predicted_teacher = self.predictor(fused_jepa)
+
+            enc_list_0, x_list_0, B0 = tm_results[0][1], tm_results[0][2], tm_results[0][3]
+            N = self.configs.enc_in
+            T, D = enc_list_0[0].shape[1], enc_list_0[0].shape[2]
+            fused_finest = fused_jepa.permute(0, 1, 3, 2).reshape(B0 * N, T, D)
+            fused_enc_list = [fused_finest] + enc_list_0[1:]
+            forecast_output = self.students_multi[0].forecast_decode(B0, fused_enc_list, x_list_0)
+
+            if return_all:
+                return forecast_output, jepa_encodings, predicted_teacher
+            return forecast_output
+
         results = [
             s.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
             for s in self.students_multi
