@@ -23,8 +23,8 @@ COMMON="--task_name long_term_forecast \
   --d_ff 32 \
   --learning_rate 0.01 \
   --train_epochs 10 \
-  --patience 10 \
-  --batch_size 128 \
+  --patience 3 \
+  --batch_size 16 \
   --down_sampling_layers 3 \
   --down_sampling_method avg \
   --down_sampling_window 2 \
