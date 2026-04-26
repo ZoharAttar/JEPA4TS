@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch import optim
 import os
+import csv
 import time
 import warnings
 import numpy as np
@@ -140,6 +141,11 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         if not os.path.exists(path):
             os.makedirs(path)
         
+        csv_path = os.path.join(path, 'training_log.csv')
+        csv_file = open(csv_path, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['epoch', 'train_loss', 'train_pred_loss', 'train_jepa_loss', 'vali_loss', 'test_loss'])
+        
         time_now = time.time()
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
@@ -272,12 +278,18 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
             print(f"   Test Loss:  {test_loss:.7f}")
             print(f"{'='*70}\n")
             
+            csv_writer.writerow([epoch + 1, train_loss, train_pred_loss, train_jepa_loss, vali_loss, test_loss])
+            csv_file.flush()
+            
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("⚠️ Early stopping triggered!")
                 break
             
             adjust_learning_rate(model_optim, epoch + 1, self.args)
+        
+        csv_file.close()
+        print(f"📄 Training log saved to {csv_path}")
         
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
