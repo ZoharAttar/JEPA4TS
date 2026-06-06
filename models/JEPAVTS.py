@@ -400,14 +400,27 @@ class Model(nn.Module):
             predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
         elif student_model_name == 'TimeMixer':
             patch_num = None
+            self.timemixer_jepa_scale = getattr(configs, 'timemixer_jepa_scale', 'fine')
+            ds_layers = getattr(configs, 'down_sampling_layers', 0)
+            ds_window = getattr(configs, 'down_sampling_window', 1)
+            if self.timemixer_jepa_scale == 'coarse' and ds_layers > 0:
+                self.timemixer_jepa_idx = -1
+                jepa_T = configs.seq_len // (ds_window ** ds_layers)
+            else:
+                self.timemixer_jepa_idx = 0
+                jepa_T = configs.seq_len
+            self.timemixer_jepa_T = jepa_T
             if getattr(configs, 'channel_independence', 1):
-                # channel_independence=True: enc [B*N, seq_len, d_model] → [B, N, d_model, seq_len]
+                # channel_independence=True: enc [B*N, T, d_model] → [B, N, d_model, T]
                 self.encoding_type = '4D_timemixer'
-                predictor_input_shape = (configs.enc_in, configs.d_model, configs.seq_len)
+                predictor_input_shape = (configs.enc_in, configs.d_model, jepa_T)
             else:
                 # channel_independence=False: enc [B, seq_len, d_model] (all vars mixed)
                 self.encoding_type = '3D'
-                predictor_input_shape = (configs.seq_len, configs.d_model, 1)
+                predictor_input_shape = (jepa_T, configs.d_model, 1)
+            print(f"✅ TimeMixer JEPA scale: {self.timemixer_jepa_scale} "
+                  f"(idx={self.timemixer_jepa_idx}, T={jepa_T}, "
+                  f"flatten={configs.d_model * jepa_T})")
         elif student_model_name == 'TimesNet':
             # TimesNet: encoding shape is [B, T, d_model]
             patch_num = None
@@ -579,16 +592,27 @@ class Model(nn.Module):
         else:
             return self.predictor(student_encoding)
     
+    def _inject_fused_into_enc_list(self, enc_list, combined_encoding, B):
+        """Inject fused JEPA encoding into enc_list at the configured scale index."""
+        jepa_idx = self.timemixer_jepa_idx
+        N = self.configs.enc_in
+        T, D = enc_list[jepa_idx].shape[1], enc_list[jepa_idx].shape[2]
+        fused = combined_encoding.permute(0, 1, 3, 2).reshape(B * N, T, D)
+        if jepa_idx == 0:
+            return [fused] + enc_list[1:]
+        return enc_list[:jepa_idx] + [fused]
+
     def _timemixer_encode(self, student, x_enc, x_mark_enc, x_dec, x_mark_dec):
         """
-        Encode with TimeMixer and reshape finest-scale encoding to 4D for JEPA.
-        Returns: (jepa_encoding [B, N, d_model, seq_len], enc_out_list, x_list, B_size)
+        Encode with TimeMixer and reshape selected-scale encoding to 4D for JEPA.
+        Scale is controlled by timemixer_jepa_scale ('fine' → [0], 'coarse' → [-1]).
+        Returns: (jepa_encoding [B, N, d_model, T], enc_out_list, x_list, B_size)
         """
         enc_out_list, x_list, B = student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
-        enc_finest = enc_out_list[0]  # [B*N, seq_len, d_model]
+        enc_jepa = enc_out_list[self.timemixer_jepa_idx]  # [B*N, T, d_model]
         N = self.configs.enc_in
-        T, D = enc_finest.shape[1], enc_finest.shape[2]
-        jepa_encoding = enc_finest.reshape(B, N, T, D).permute(0, 1, 3, 2)  # [B, N, d_model, seq_len]
+        T, D = enc_jepa.shape[1], enc_jepa.shape[2]
+        jepa_encoding = enc_jepa.reshape(B, N, T, D).permute(0, 1, 3, 2)  # [B, N, d_model, T]
         return jepa_encoding, enc_out_list, x_list, B
 
     def student_forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
@@ -626,11 +650,7 @@ class Model(nn.Module):
                 self.student2, x_enc, x_mark_enc, x_dec, x_mark_dec)
             predicted_teacher_encoding = self._predict_teacher(jepa_enc2)
             combined_encoding = self.encoder_fusion(jepa_enc1, jepa_enc2)
-            # Decode using student1 with its own enc_out_list fused
-            N = self.configs.enc_in
-            T, D = enc_list1[0].shape[1], enc_list1[0].shape[2]
-            fused_finest = combined_encoding.permute(0, 1, 3, 2).reshape(B1 * N, T, D)
-            fused_enc_list = [fused_finest] + enc_list1[1:]
+            fused_enc_list = self._inject_fused_into_enc_list(enc_list1, combined_encoding, B1)
             forecast_output = self.student1.forecast_decode(B1, fused_enc_list, x_list1)
             if return_all:
                 return forecast_output, predicted_teacher_encoding
@@ -673,10 +693,7 @@ class Model(nn.Module):
                 predicted_teacher = self.predictor(fused_jepa)
 
             enc_list_0, x_list_0, B0 = tm_results[0][1], tm_results[0][2], tm_results[0][3]
-            N = self.configs.enc_in
-            T, D = enc_list_0[0].shape[1], enc_list_0[0].shape[2]
-            fused_finest = fused_jepa.permute(0, 1, 3, 2).reshape(B0 * N, T, D)
-            fused_enc_list = [fused_finest] + enc_list_0[1:]
+            fused_enc_list = self._inject_fused_into_enc_list(enc_list_0, fused_jepa, B0)
             forecast_output = self.students_multi[0].forecast_decode(B0, fused_enc_list, x_list_0)
 
             if return_all:
@@ -739,11 +756,7 @@ class Model(nn.Module):
 
             all_encs = [fc_jepa] + jepa_encodings
             fused = self.encoder_fusion(all_encs)
-
-            N = self.configs.enc_in
-            T, D = fc_enc_list[0].shape[1], fc_enc_list[0].shape[2]
-            fused_finest = fused.permute(0, 1, 3, 2).reshape(fc_B * N, T, D)
-            fused_enc_list = [fused_finest] + fc_enc_list[1:]
+            fused_enc_list = self._inject_fused_into_enc_list(fc_enc_list, fused, fc_B)
             forecast_output = self.student_forecast.forecast_decode(fc_B, fused_enc_list, fc_x_list)
 
             if return_all:
