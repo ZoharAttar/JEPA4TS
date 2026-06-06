@@ -185,6 +185,10 @@ if __name__ == '__main__':
                         help='Use per-variable DINO teacher embeddings [B, N, 768] instead of '
                              'averaged [B, 768]. Requires precomputed per-var embeddings '
                              '(run precompute_embeddings_pervar.py first).')
+    parser.add_argument('--timemixer_jepa_scale', type=str, default='fine',
+                        choices=['fine', 'coarse'],
+                        help='TimeMixer scale for JEPA branch: fine=enc_out_list[0], '
+                             'coarse=enc_out_list[-1]. Requires down_sampling_layers>0 for coarse.')
 
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
