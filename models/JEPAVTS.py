@@ -23,16 +23,17 @@ class VisionTSTeacher(nn.Module):
                  from cache with _pervar suffix. If False, loads averaged [768].
     """
     
-    def __init__(self, dataset_name="ETTh1", hidden_size=768, rendering_method=None, per_var=False):
+    def __init__(self, dataset_name="ETTh1", hidden_size=768, rendering_method=None, per_var=False, root_path=None):
         super().__init__()
         self.rendering_method = rendering_method
         self.per_var = per_var
         
         suffix = "_pervar" if per_var else ""
+        root = root_path.rstrip('/') if root_path else "./dataset/ETT-small/"
         if rendering_method:
-            self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}_{rendering_method}{suffix}"
+            self.cache_dir = f"{root}/dino_embeddings_{dataset_name}_{rendering_method}{suffix}"
         else:
-            self.cache_dir = f"./dataset/ETT-small/dino_embeddings_{dataset_name}{suffix}"
+            self.cache_dir = f"{root}/dino_embeddings_{dataset_name}{suffix}"
         self.hidden_size = hidden_size
         
         if not os.path.exists(self.cache_dir):
@@ -315,7 +316,7 @@ class Model(nn.Module):
             self.num_renderings = len(self.rendering_methods)
             self.teachers = nn.ModuleList([
                 VisionTSTeacher(dataset_name=self.data, rendering_method=method,
-                                per_var=self.per_var_teacher)
+                                per_var=self.per_var_teacher,root_path=getattr(configs,'root_path',None))
                 for method in self.rendering_methods
             ])
             self.teacher_dim = self.teachers[0].hidden_size
@@ -332,7 +333,7 @@ class Model(nn.Module):
             self.multi_rendering = False
             self.num_renderings = 1
             self.teacher = VisionTSTeacher(dataset_name=self.data,
-                                           per_var=self.per_var_teacher)
+                                           per_var=self.per_var_teacher,root_path=getattr(configs,'root_path',None))
             self.teacher_dim = self.teacher.hidden_size
         
         print(f"✅ Teacher dimension: {self.teacher_dim}")
