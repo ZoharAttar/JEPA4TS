@@ -28,6 +28,8 @@ COMMON="--task_name long_term_forecast \
   --down_sampling_layers 3 \
   --down_sampling_method avg \
   --down_sampling_window 2 \
+  --dropout 0.6 \
+  --timemixer_jepa_scale coarse \
   --per_var_teacher"
 
 # ═══════════════════════════════════════════════════════════
@@ -38,7 +40,9 @@ COMMON="--task_name long_term_forecast \
 python -u run.py $COMMON --model_id ETTh2_RP_single_jw1    --rendering_methods RP --jepa_weight 1
 python -u run.py $COMMON --model_id ETTh2_RP_single_jw1.5  --rendering_methods RP --jepa_weight 1.5
 python -u run.py $COMMON --model_id ETTh2_RP_single_jw10   --rendering_methods RP --jepa_weight 10
+python -u run.py $COMMON --model_id ETTh2_RP_single_jw15   --rendering_methods RP --jepa_weight 15
 python -u run.py $COMMON --model_id ETTh2_RP_single_jw20   --rendering_methods RP --jepa_weight 20
+
 
 # --- Dual encoder MLP, varying jepa_weight ---
 python -u run.py $COMMON --model_id ETTh2_RP_dual_mlp_jw1    --rendering_methods RP --jepa_weight 1   --use_dual_encoder --fusion_type mlp
@@ -66,11 +70,11 @@ python -u run.py $COMMON --model_id ETTh2_RP_dual_transformer_learned  --renderi
 
 # --- Single encoder ---
 python -u run.py $COMMON --model_id ETTh2_GAF_single_jw1   --rendering_methods GAF --jepa_weight 1
-python -u run.py $COMMON --model_id ETTh2_GAF_single_jw1.5 --rendering_methods GAF --jepa_weight 1.5
+python -u run.py $COMMON --model_id ETTh2_GAF_single_jw20 --rendering_methods GAF --jepa_weight 20
 
 # --- Dual encoder MLP ---
 python -u run.py $COMMON --model_id ETTh2_GAF_dual_mlp_jw1   --rendering_methods GAF --jepa_weight 1   --use_dual_encoder --fusion_type mlp
-python -u run.py $COMMON --model_id ETTh2_GAF_dual_mlp_jw1.5 --rendering_methods GAF --jepa_weight 1.5 --use_dual_encoder --fusion_type mlp
+python -u run.py $COMMON --model_id ETTh2_GAF_dual_mlp_jw20 --rendering_methods GAF --jepa_weight 20 --use_dual_encoder --fusion_type mlp
 
 # ═══════════════════════════════════════════════════════════
 # TABLE 3: JEPAVTS + TimeMixer + GAF+RP + horizon96 (jepa_weight=1)
