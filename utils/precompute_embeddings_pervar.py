@@ -9,11 +9,14 @@ Usage:
     python utils/precompute_embeddings_pervar.py --dataset weather --method LinePlot
 
     # Run all combos:
-    for d in ETTh1 ETTh2 ETTm1 ETTm2 weather; do
+    for d in ETTh1 ETTh2 ETTm1 ETTm2 weather electricity traffic exchange_rate national_illness; do
       for m in RP GAF LinePlot; do
         python utils/precompute_embeddings_pervar.py --dataset $d --method $m
       done
     done
+
+Note: datasets other than ETT*/weather/national_illness require the corresponding
+CSV to be present under ./dataset/<name>/ (e.g. electricity, traffic, exchange_rate).
 """
 
 import os
@@ -79,6 +82,42 @@ DATASET_CONFIGS = {
         'data_path': 'weather.csv',
         'cache_base': './dataset/weather/dino_embeddings_weather',
         'freq': 'h',
+        'features': 'M',
+        'target': 'OT',
+    },
+    'electricity': {
+        'data': 'custom',
+        'root_path': './dataset/electricity/',
+        'data_path': 'electricity.csv',
+        'cache_base': './dataset/electricity/dino_embeddings_electricity',
+        'freq': 'h',
+        'features': 'M',
+        'target': 'OT',
+    },
+    'traffic': {
+        'data': 'custom',
+        'root_path': './dataset/traffic/',
+        'data_path': 'traffic.csv',
+        'cache_base': './dataset/traffic/dino_embeddings_traffic',
+        'freq': 'h',
+        'features': 'M',
+        'target': 'OT',
+    },
+    'exchange_rate': {
+        'data': 'custom',
+        'root_path': './dataset/exchange_rate/',
+        'data_path': 'exchange_rate.csv',
+        'cache_base': './dataset/exchange_rate/dino_embeddings_exchange_rate',
+        'freq': 'd',
+        'features': 'M',
+        'target': 'OT',
+    },
+    'national_illness': {
+        'data': 'custom',
+        'root_path': './dataset/',
+        'data_path': 'national_illness.csv',
+        'cache_base': './dataset/dino_embeddings_national_illness',
+        'freq': 'w',
         'features': 'M',
         'target': 'OT',
     },
