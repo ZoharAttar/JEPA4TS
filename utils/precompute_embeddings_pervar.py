@@ -25,6 +25,16 @@ import hashlib
 from tqdm import tqdm
 from transformers import AutoModel
 import shutil
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path so imports work when running this script
+# directly (python utils/precompute_embeddings_pervar.py). When Python runs a
+# script, sys.path[0] is the script's directory (utils/), so sibling packages
+# like `data_provider` are not found unless the project root is added.
+project_root = str(Path(__file__).resolve().parents[1])
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 DATASET_CONFIGS = {
     'ETTh1': {
