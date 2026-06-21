@@ -398,6 +398,13 @@ class Model(nn.Module):
             patch_num = int((configs.seq_len - patch_len) / stride + 2)
             self.encoding_type = '4D'  # [B, nvars, d_model, patch_num]
             predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
+        elif student_model_name == 'iTransformer':
+            # iTransformer.encode returns [B, nvars(+covariate tokens), d_model].
+            # For JEPA we keep the nvars variable tokens and treat each as a
+            # patch_num=1 token → predictor input [B, nvars, d_model, 1].
+            patch_num = 1
+            self.encoding_type = 'itransformer'
+            predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
         elif student_model_name == 'TimeMixer':
             patch_num = None
             self.timemixer_jepa_scale = getattr(configs, 'timemixer_jepa_scale', 'fine')
@@ -579,6 +586,23 @@ class Model(nn.Module):
             else:
                 return self.teacher(x_enc)
     
+    def _to_jepa_encoding(self, student_encoding):
+        """Convert a raw student encoding into the shape expected by the JEPA
+        predictor.
+
+        For iTransformer, `encode()` returns [B, nvars(+covariate tokens), d_model]
+        (logic untouched in the model). Here we keep only the nvars variable tokens
+        and add a trailing dim → [B, nvars, d_model, 1], matching the predictor's
+        input_shape=(enc_in, d_model, 1). For every other backbone this is a no-op.
+
+        Note: decoding always uses the full (unmodified) encoding; only the JEPA
+        alignment branch uses this view.
+        """
+        if self.encoding_type == 'itransformer':
+            N = self.configs.enc_in
+            return student_encoding[:, :N, :].unsqueeze(-1)
+        return student_encoding
+
     def _predict_teacher(self, student_encoding):
         """
         Apply JEPA predictor(s) to student encoding.
@@ -630,7 +654,7 @@ class Model(nn.Module):
             return forecast_output
 
         student_encoding, means, stdev = self.student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
-        predicted_teacher_encoding = self._predict_teacher(student_encoding)
+        predicted_teacher_encoding = self._predict_teacher(self._to_jepa_encoding(student_encoding))
         forecast_output = self.student.forecast_decode(student_encoding, means, stdev)
         
         if return_all:
@@ -659,7 +683,7 @@ class Model(nn.Module):
         student_encoding1, means1, stdev1 = self.student1.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         student_encoding2, means2, stdev2 = self.student2.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         
-        predicted_teacher_encoding = self._predict_teacher(student_encoding2)
+        predicted_teacher_encoding = self._predict_teacher(self._to_jepa_encoding(student_encoding2))
 
         combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
         forecast_output = self.student1.forecast_decode(combined_encoding, means1, stdev1)
@@ -713,12 +737,12 @@ class Model(nn.Module):
         if self.use_multi_predictor:
             # Option 3: each predictor_i paired with student_encoding_i
             predicted_teacher = [
-                pred(enc)
+                pred(self._to_jepa_encoding(enc))
                 for pred, enc in zip(self.predictors, student_encodings)
             ]
         else:
             # Option 4: shared predictor on fused encoding
-            predicted_teacher = self.predictor(fused_encoding)
+            predicted_teacher = self.predictor(self._to_jepa_encoding(fused_encoding))
         
         # Decode using first student's decoder and normalisation stats
         means_0, stdev_0 = results[0][1], results[0][2]
@@ -774,11 +798,12 @@ class Model(nn.Module):
 
         if self.use_multi_predictor:
             predicted_teacher = [
-                pred(enc) for pred, enc in zip(self.predictors, jepa_encodings)
+                pred(self._to_jepa_encoding(enc))
+                for pred, enc in zip(self.predictors, jepa_encodings)
             ]
         else:
             fused_jepa = torch.stack(jepa_encodings, dim=0).mean(dim=0)
-            predicted_teacher = self.predictor(fused_jepa)
+            predicted_teacher = self.predictor(self._to_jepa_encoding(fused_jepa))
 
         all_encs = [fc_enc] + jepa_encodings
         fused = self.encoder_fusion(all_encs)
