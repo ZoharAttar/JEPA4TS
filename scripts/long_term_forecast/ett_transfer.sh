@@ -75,12 +75,20 @@ get_cfg() {
 ds_root() { echo "./dataset/ETT-small/"; }
 ds_file() { echo "$1.csv"; }
 
-# A short, unique tag identifying the trained source model (appears inside the
-# run.py "setting" string, so we can locate the checkpoint folder by glob).
+# Source model_id (appears inside the run.py "setting" string, so we can locate
+# the checkpoint folder by glob). For JEPAVTS this MATCHES the model_id used by
+# JEPAVTS_TimeMixer_all_datasets.sh / JEPAVTS_iTransformer_all_datasets.sh
+# (<dataset>_<RENDER>_<seq>_<pred>_<single|dual>), so if you already trained the
+# source models with those scripts, training here is SKIPPED and the existing
+# checkpoint is reused for transfer. Set REUSE_TRAINED=0 to force the zsT_ tag
+# (always train fresh, isolated from your main runs).
+REUSE_TRAINED="${REUSE_TRAINED:-1}"
 src_tag() {
   local src=$1 pred=$2
-  if [ "$MODEL" = "JEPAVTS" ]; then
-    local dtag="single"; [ "$USE_DUAL" = "1" ] && dtag="dual"
+  local dtag="single"; [ "$USE_DUAL" = "1" ] && dtag="dual"
+  if [ "$MODEL" = "JEPAVTS" ] && [ "$REUSE_TRAINED" = "1" ]; then
+    echo "${src}_${RENDER}_${SEQ_LEN}_${pred}_${dtag}"
+  elif [ "$MODEL" = "JEPAVTS" ]; then
     echo "zsT_${MODEL}_${STUDENT}_${RENDER}_${dtag}_${src}_${SEQ_LEN}_${pred}"
   else
     echo "zsT_${MODEL}_${src}_${SEQ_LEN}_${pred}"
