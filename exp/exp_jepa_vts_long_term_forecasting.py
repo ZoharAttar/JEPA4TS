@@ -300,8 +300,10 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
         if test:
-            print('📂 Loading model...')
-            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+            transfer_ckpt = getattr(self.args, 'transfer_checkpoint', '')
+            ckpt_path = transfer_ckpt if transfer_ckpt else os.path.join('./checkpoints/' + setting, 'checkpoint.pth')
+            print('📂 Loading model from {}...'.format(ckpt_path))
+            self.model.load_state_dict(torch.load(ckpt_path))
         
         preds = []
         trues = []
