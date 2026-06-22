@@ -47,15 +47,45 @@ from precompute_embeddings_pervar import (
 
 
 DATASET_CONFIGS = {
+    'EthanolConcentration': {
+        'data': 'UEA',
+        'root_path': './dataset/EthanolConcentration/',
+        'cache_base': './dataset/EthanolConcentration/dino_embeddings_EthanolConcentration',
+    },
+    'FaceDetection': {
+        'data': 'UEA',
+        'root_path': './dataset/FaceDetection/',
+        'cache_base': './dataset/FaceDetection/dino_embeddings_FaceDetection',
+    },
     'Handwriting': {
         'data': 'UEA',
         'root_path': './dataset/Handwriting/',
         'cache_base': './dataset/Handwriting/dino_embeddings_Handwriting',
     },
+    'Heartbeat': {
+        'data': 'UEA',
+        'root_path': './dataset/Heartbeat/',
+        'cache_base': './dataset/Heartbeat/dino_embeddings_Heartbeat',
+    },
     'JapaneseVowels': {
         'data': 'UEA',
         'root_path': './dataset/JapaneseVowels/',
         'cache_base': './dataset/JapaneseVowels/dino_embeddings_JapaneseVowels',
+    },
+    'PEMS-SF': {
+        'data': 'UEA',
+        'root_path': './dataset/PEMS-SF/',
+        'cache_base': './dataset/PEMS-SF/dino_embeddings_PEMS-SF',
+    },
+    'SelfRegulationSCP1': {
+        'data': 'UEA',
+        'root_path': './dataset/SelfRegulationSCP1/',
+        'cache_base': './dataset/SelfRegulationSCP1/dino_embeddings_SelfRegulationSCP1',
+    },
+    'SelfRegulationSCP2': {
+        'data': 'UEA',
+        'root_path': './dataset/SelfRegulationSCP2/',
+        'cache_base': './dataset/SelfRegulationSCP2/dino_embeddings_SelfRegulationSCP2',
     },
     'SpokenArabicDigits': {
         'data': 'UEA',
