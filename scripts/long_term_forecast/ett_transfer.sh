@@ -116,8 +116,12 @@ model_flags() {
 }
 
 find_ckpt() {
-  local tag=$1
-  ls -1 ./checkpoints/*"${tag}"*/checkpoint.pth 2>/dev/null | head -1
+  # Match tag AND dm/df, because the run.py "setting" string does NOT include the
+  # student model name — different students (e.g. iTransformer vs TimeMixer) share
+  # the same all-datasets model_id and only differ by d_model/d_ff. Without this,
+  # a glob on the tag alone can grab the wrong student's checkpoint.
+  local tag=$1 d_model=$2 d_ff=$3
+  ls -1 ./checkpoints/*"${tag}"*_dm"${d_model}"_*_df"${d_ff}"_*/checkpoint.pth 2>/dev/null | head -1
 }
 
 # ---------------------------------------------------------------------------
@@ -130,8 +134,8 @@ for src in $sources; do
   IFS='|' read -r enc_in e_layers d_model d_ff batch ds_layers lr epochs patience dropout <<< "$(get_cfg "$src")" || exit 1
   for pred in $PRED_LENS; do
     tag="$(src_tag "$src" "$pred")"
-    if [ -n "$(find_ckpt "$tag")" ]; then
-      echo "[train] SKIP (checkpoint exists): $tag"
+    if [ -n "$(find_ckpt "$tag" "$d_model" "$d_ff")" ]; then
+      echo "[train] SKIP (checkpoint exists): $tag (dm$d_model df$d_ff)"
       continue
     fi
     echo "[train] $tag"
@@ -176,9 +180,9 @@ for pair in $PAIRS; do
   IFS='|' read -r enc_in e_layers d_model d_ff batch ds_layers lr epochs patience dropout <<< "$(get_cfg "$src")" || exit 1
   for pred in $PRED_LENS; do
     tag="$(src_tag "$src" "$pred")"
-    ckpt="$(find_ckpt "$tag")"
+    ckpt="$(find_ckpt "$tag" "$d_model" "$d_ff")"
     if [ -z "$ckpt" ]; then
-      echo "[eval] MISSING source checkpoint for $tag — skipping $src->$tgt pl$pred"
+      echo "[eval] MISSING source checkpoint for $tag (dm$d_model df$d_ff) — skipping $src->$tgt pl$pred"
       continue
     fi
     eval_id="zsEVAL_${MODEL}_${src}2${tgt}_${SEQ_LEN}_${pred}"
