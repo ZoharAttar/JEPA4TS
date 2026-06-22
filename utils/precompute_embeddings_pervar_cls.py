@@ -39,7 +39,7 @@ from tqdm import tqdm
 from transformers import AutoModel
 
 # Reuse the existing per-variable transforms (single source of truth).
-from precompute_embeddings_pervar import (
+from utils.precompute_embeddings_pervar import (
     transform_GAF_pervar,
     transform_RP_pervar,
     transform_lineplot_pervar,
@@ -258,7 +258,6 @@ def main():
         task_name='classification',
         data=cfg['data'],
         root_path=cfg['root_path'],
-        model_id=cli.dataset,
         seq_len=cli.seq_len if cli.seq_len > 0 else 1024,
         batch_size=cli.batch_size,
         num_workers=0,
