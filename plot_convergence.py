@@ -15,6 +15,16 @@ Usage:
     # Save to file instead of displaying
     python plot_convergence.py --logs ... --save convergence.pdf
 """
+# python plot_convergence.py     
+# --save ETTh1_96_w20_comparison.pdf     
+# --logs ./checkpoints/long_term_forecast_ETTh1_96_96_TimeMixer_ETTh1_ftM_sl96_ll0_pl96_dm16_nh8_el2_dl1_df32_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0/training_log.csv           
+#         ./checkpoints/long_term_forecast_ETTh1_RP_dual_mlp_jw20_JEPAVTS_ETTh1_ftM_sl96_ll0_pl96_dm16_nh8_el2_dl1_df32_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0/training_log.csv     
+# --labels TimeMixer JEPAVTS
+# python plot_convergence.py \
+#         -- save ETTh1_96_w20_comparison.pdf \   
+#         --logs ./checkpoints/long_term_forecast_ETTh1_96_96_TimeMixer_ETTh1_ftM_sl96_ll0_pl96_dm16_nh8_el2_dl1_df32_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0/training_log.csv \
+#               ./checkpoints/long_term_forecast_ETTh1_RP_dual_mlp_jw20_JEPAVTS_ETTh1_ftM_sl96_ll0_pl96_dm16_nh8_el2_dl1_df32_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0/training_log.csv \
+#         --labels TimeMixer JEPAVTS
 
 import argparse
 import csv
