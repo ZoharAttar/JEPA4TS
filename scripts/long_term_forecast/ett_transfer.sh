@@ -14,8 +14,10 @@
 #   checkpoint. Only root_path/data_path/data switch to the TARGET at eval time.
 #   All ETT datasets share enc_in=7, so checkpoints load cleanly across them.
 #
-# Per-dataset hyper-params are IDENTICAL to
-#   scripts/long_term_forecast/JEPAVTS_TimeMixer_all_datasets.sh
+# Per-dataset hyper-params are IDENTICAL to the matching all-datasets script,
+# selected automatically by the effective backbone (STUDENT for JEPAVTS):
+#   TimeMixer    -> scripts/long_term_forecast/JEPAVTS_TimeMixer_all_datasets.sh
+#   iTransformer -> scripts/long_term_forecast/JEPAVTS_iTransformer_all_datasets.sh
 #
 # Results are appended to:
 #   - JEPAVTS:  result_jepa_vts.txt
@@ -59,15 +61,30 @@ PAIRS="${PAIRS:-ETTh1:ETTh2 ETTh1:ETTm2 ETTh2:ETTh1 ETTm1:ETTh2 ETTm1:ETTm2 ETTm
 LOG_DIR="${LOG_DIR:-logs/zero_shot_transfer}"
 mkdir -p "$LOG_DIR"
 
-# Per-dataset config — same values as JEPAVTS_TimeMixer_all_datasets.sh.
-# Field order: enc_in|e_layers|d_model|d_ff|batch_size|ds_layers|lr|epochs|patience|dropout
+# Effective backbone: the student (when MODEL=JEPAVTS) or the model itself.
+BACKBONE="$MODEL"; [ "$MODEL" = "JEPAVTS" ] && BACKBONE="$STUDENT"
+
+# Per-(backbone, dataset) config — IDENTICAL to the matching all-datasets script:
+#   TimeMixer    -> JEPAVTS_TimeMixer_all_datasets.sh
+#   iTransformer -> JEPAVTS_iTransformer_all_datasets.sh
+# Field order: enc_in|e_layers|d_model|d_ff|batch|lr|epochs|patience|dropout|factor|ds_layers
+# (factor used by iTransformer; ds_layers used by TimeMixer downsampling.)
 get_cfg() {
-  case "$1" in
-    ETTh1) echo "7|2|16|32|128|3|0.01|10|3|0.6" ;;
-    ETTh2) echo "7|2|16|32|128|3|0.01|10|3|0.6" ;;
-    ETTm1) echo "7|2|16|32|128|3|0.01|10|3|0.1" ;;
-    ETTm2) echo "7|2|32|64|128|3|0.01|10|3|0.1" ;;
-    *) echo "UNKNOWN dataset: $1" >&2; return 1 ;;
+  local ds=$1
+  case "$BACKBONE" in
+    TimeMixer)
+      case "$ds" in
+        ETTh1|ETTh2) echo "7|2|16|32|128|0.01|10|3|0.6|1|3" ;;
+        ETTm1)       echo "7|2|16|32|128|0.01|10|3|0.1|1|3" ;;
+        ETTm2)       echo "7|2|32|64|128|0.01|10|3|0.1|1|3" ;;
+        *) echo "UNKNOWN dataset: $ds" >&2; return 1 ;;
+      esac ;;
+    iTransformer)
+      case "$ds" in
+        ETTh1|ETTh2|ETTm1|ETTm2) echo "7|2|128|128|32|0.0001|10|3|0.1|3|0" ;;
+        *) echo "UNKNOWN dataset: $ds" >&2; return 1 ;;
+      esac ;;
+    *) echo "No config for backbone=$BACKBONE dataset=$ds (add it to get_cfg)" >&2; return 1 ;;
   esac
 }
 
@@ -131,7 +148,7 @@ sources=$(for p in $PAIRS; do echo "${p%%:*}"; done | sort -u)
 echo ">>> Sources to train: $sources"
 
 for src in $sources; do
-  IFS='|' read -r enc_in e_layers d_model d_ff batch ds_layers lr epochs patience dropout <<< "$(get_cfg "$src")" || exit 1
+  IFS='|' read -r enc_in e_layers d_model d_ff batch lr epochs patience dropout factor ds_layers <<< "$(get_cfg "$src")" || exit 1
   for pred in $PRED_LENS; do
     tag="$(src_tag "$src" "$pred")"
     if [ -n "$(find_ckpt "$tag" "$d_model" "$d_ff")" ]; then
@@ -156,6 +173,7 @@ for src in $sources; do
       --c_out "$enc_in" \
       --d_model "$d_model" \
       --d_ff "$d_ff" \
+      --factor "$factor" \
       --batch_size "$batch" \
       --learning_rate "$lr" \
       --train_epochs "$epochs" \
@@ -177,7 +195,7 @@ done
 for pair in $PAIRS; do
   src="${pair%%:*}"
   tgt="${pair##*:}"
-  IFS='|' read -r enc_in e_layers d_model d_ff batch ds_layers lr epochs patience dropout <<< "$(get_cfg "$src")" || exit 1
+  IFS='|' read -r enc_in e_layers d_model d_ff batch lr epochs patience dropout factor ds_layers <<< "$(get_cfg "$src")" || exit 1
   for pred in $PRED_LENS; do
     tag="$(src_tag "$src" "$pred")"
     ckpt="$(find_ckpt "$tag" "$d_model" "$d_ff")"
@@ -206,6 +224,7 @@ for pair in $PAIRS; do
       --c_out "$enc_in" \
       --d_model "$d_model" \
       --d_ff "$d_ff" \
+      --factor "$factor" \
       --batch_size "$batch" \
       --dropout "$dropout" \
       --des Exp --itr 1 \
