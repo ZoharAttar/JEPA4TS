@@ -306,7 +306,23 @@ class Model(nn.Module):
         self.data = getattr(configs, 'data')
         self.rendering_methods = getattr(configs, 'rendering_methods', None)
         self.per_var_teacher = getattr(configs, 'per_var_teacher', False)
-        
+
+        # Channel-independent TimesNet for classification: TimesNet mixes channels
+        # in its embedding (Conv1d: enc_in -> d_model), so it has no native
+        # per-variable representation. To align each variable with its own DINO
+        # embedding (per_var teacher), we fold the variables into the batch and
+        # encode each as a univariate series (built with enc_in=1), producing a
+        # per-variable encoding [B, N, d_model, T] — exactly like channel-
+        # independent PatchTST/TimeMixer. Only enabled for classification with a
+        # per-variable teacher; plain TimesNet stays channel-mixed.
+        self.timesnet_ci = (
+            student_model_name == 'TimesNet'
+            and self.task_name == 'classification'
+            and self.per_var_teacher
+        )
+        if self.timesnet_ci:
+            print("✅ Channel-independent TimesNet: per-variable encoding [B, N, d_model, T]")
+
         if self.per_var_teacher:
             print("✅ Per-variable teacher mode: each variable gets its own DINO embedding")
         
@@ -429,10 +445,18 @@ class Model(nn.Module):
                   f"(idx={self.timemixer_jepa_idx}, T={jepa_T}, "
                   f"flatten={configs.d_model * jepa_T})")
         elif student_model_name == 'TimesNet':
-            # TimesNet: encoding shape is [B, T, d_model]
-            patch_num = None
-            self.encoding_type = '3D'  # [B, T, d_model]
-            predictor_input_shape = (configs.seq_len, configs.d_model, 1)  # Treat as [B, T, d_model, 1]
+            if self.timesnet_ci:
+                # Channel-independent: per-variable encoding [B, N, d_model, T].
+                # Reuse the 4D machinery (predictor / classification head / fusion)
+                # by treating the time axis as patch_num.
+                patch_num = configs.seq_len
+                self.encoding_type = '4D'  # [B, nvars, d_model, T]
+                predictor_input_shape = (configs.enc_in, configs.d_model, configs.seq_len)
+            else:
+                # Channel-mixed (original): [B, T, d_model]
+                patch_num = None
+                self.encoding_type = '3D'  # [B, T, d_model]
+                predictor_input_shape = (configs.seq_len, configs.d_model, 1)  # Treat as [B, T, d_model, 1]
         else:
             # For non-patch models (DLinear, etc.), use 1D input
             patch_num = None
@@ -546,6 +570,16 @@ class Model(nn.Module):
         
         if model_name not in Exp_Basic.MODEL_DICT:
             raise NotImplementedError(f"Student model {model_name} not found")
+        
+        # Channel-independent TimesNet: build a UNIVARIATE backbone (enc_in=1).
+        # The variables are folded into the batch at encode time (see _encode_cls),
+        # so each variable is embedded/encoded independently.
+        if getattr(self, 'timesnet_ci', False) and model_name == 'TimesNet':
+            import copy
+            ci_configs = copy.copy(configs)
+            ci_configs.enc_in = 1
+            ci_configs.c_out = 1
+            return Exp_Basic.MODEL_DICT[model_name].Model(ci_configs)
         
         return Exp_Basic.MODEL_DICT[model_name].Model(configs)
 
@@ -813,6 +847,24 @@ class Model(nn.Module):
             return forecast_output, jepa_encodings, predicted_teacher
         return forecast_output
 
+    def _encode_cls(self, student, x_enc):
+        """Encode a batch for classification.
+
+        For channel-independent TimesNet, fold the variables into the batch so
+        each variable is embedded/encoded as its own univariate series, then
+        return a per-variable 4D encoding [B, N, d_model, T]. For every other
+        backbone this just calls the student's native encode (e.g. TimesNet
+        channel-mixed [B, T, d_model]).
+        """
+        if self.timesnet_ci:
+            B, T, N = x_enc.shape
+            x = x_enc.permute(0, 2, 1).reshape(B * N, T, 1)  # [B*N, T, 1]
+            enc = student.encode(x)                          # [B*N, T, d_model]
+            D = enc.shape[-1]
+            enc = enc.reshape(B, N, T, D).permute(0, 1, 3, 2)  # [B, N, d_model, T]
+            return enc
+        return student.encode(x_enc)
+
     def classification_forward(self, x_enc, padding_mask=None, return_all=False):
         """
         Classification forward pass
@@ -821,7 +873,7 @@ class Model(nn.Module):
         Returns: class logits [batch, num_classes]
         """
         # Get student encoding 
-        student_encoding = self.student.encode(x_enc)
+        student_encoding = self._encode_cls(self.student, x_enc)
         # Classification output
         class_logits = self.classification_head(student_encoding)
         
@@ -837,8 +889,8 @@ class Model(nn.Module):
         Classification forward pass with dual encoder
         """
 
-        student_encoding1 = self.student1.encode(x_enc)
-        student_encoding2 = self.student2.encode(x_enc)
+        student_encoding1 = self._encode_cls(self.student1, x_enc)
+        student_encoding2 = self._encode_cls(self.student2, x_enc)
         
         # JEPA prediction(s) from encoder2
         predicted_teacher_encoding = self._predict_teacher(student_encoding2)
@@ -859,7 +911,7 @@ class Model(nn.Module):
         Multi-encoder classification: k students, fused for classification.
         Shared or multi predictor controlled by use_multi_predictor.
         """
-        student_encodings = [s.encode(x_enc) for s in self.students_multi]
+        student_encodings = [self._encode_cls(s, x_enc) for s in self.students_multi]
         
         # Fuse student encodings (mean) for classification
         fused_encoding = torch.stack(student_encodings, dim=0).mean(dim=0)
@@ -885,8 +937,8 @@ class Model(nn.Module):
         Multi-encoder + dual encoder classification:
         K JEPA encoders + 1 forecast encoder, all fused for classification.
         """
-        fc_encoding = self.student_forecast.encode(x_enc)
-        jepa_encodings = [s.encode(x_enc) for s in self.students_multi]
+        fc_encoding = self._encode_cls(self.student_forecast, x_enc)
+        jepa_encodings = [self._encode_cls(s, x_enc) for s in self.students_multi]
 
         if self.use_multi_predictor:
             predicted_teacher = [
