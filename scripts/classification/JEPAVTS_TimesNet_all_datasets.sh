@@ -74,21 +74,25 @@ run_one() {
     tag="dual"
   fi
 
-  local model_id="${name}_${RENDER}_${tag}"
-  local logf="$LOG_DIR/${model_id}.log"
-  local donef="$LOG_DIR/${model_id}.done"
+  # job tag: used only for per-job logs/markers (distinguishes single vs dual).
+  local job="${name}_${RENDER}_${tag}"
+  local logf="$LOG_DIR/${job}.log"
+  local donef="$LOG_DIR/${job}.done"
 
   if [ -f "$donef" ]; then
-    echo "[gpu $gpu] SKIP (already done): $model_id"
+    echo "[gpu $gpu] SKIP (already done): $job"
     return 0
   fi
 
-  echo "[gpu $gpu] START: $model_id"
+  echo "[gpu $gpu] START: $job"
+  # IMPORTANT: --model_id must be the bare dataset name — the UEA data loader
+  # uses it to locate <name>_TRAIN.ts / <name>_TEST.ts. single vs dual is kept
+  # distinct via --des (which is part of run.py's setting string).
   CUDA_VISIBLE_DEVICES=$gpu python -u run.py \
     --task_name classification \
     --is_training 1 \
     --root_path "$root_path" \
-    --model_id "$model_id" \
+    --model_id "$name" \
     --model $MODEL \
     --student_model $STUDENT \
     --data UEA \
@@ -113,9 +117,9 @@ run_one() {
   local rc=$?
   if [ $rc -eq 0 ]; then
     touch "$donef"
-    echo "[gpu $gpu] DONE:  $model_id"
+    echo "[gpu $gpu] DONE:  $job"
   else
-    echo "[gpu $gpu] FAIL (rc=$rc): $model_id  ->  see $logf"
+    echo "[gpu $gpu] FAIL (rc=$rc): $job  ->  see $logf"
   fi
   return $rc
 }
