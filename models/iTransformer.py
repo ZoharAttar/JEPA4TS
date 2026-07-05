@@ -111,17 +111,25 @@ class Model(nn.Module):
         dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, L, 1))
         return dec_out
 
-    def classification(self, x_enc, x_mark_enc):
-        # Embedding
+    def classification_encode(self, x_enc, x_mark_enc):
+        # Embedding (logic identical to classification(); x_mark_enc unused, kept
+        # for signature symmetry). Returns the per-variable encoder tokens so
+        # JEPAVTS can align each variable token with its teacher embedding.
         enc_out = self.enc_embedding(x_enc, None)
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
+        return enc_out  # (batch_size, n_vars, d_model)
 
+    def classification_decode(self, enc_out):
         # Output
         output = self.act(enc_out)  # the output transformer encoder/decoder embeddings don't include non-linearity
         output = self.dropout(output)
         output = output.reshape(output.shape[0], -1)  # (batch_size, c_in * d_model)
         output = self.projection(output)  # (batch_size, num_classes)
         return output
+
+    def classification(self, x_enc, x_mark_enc):
+        enc_out = self.classification_encode(x_enc, x_mark_enc)
+        return self.classification_decode(enc_out)
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
