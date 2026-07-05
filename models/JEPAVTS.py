@@ -285,10 +285,22 @@ class Model(nn.Module):
 
         # Determine which architecture to use
         self.use_dual_encoder = getattr(configs, 'use_dual_encoder', False)
+        # NO-DINO ablation: two student encoders fused, task loss only. No teacher,
+        # no JEPA predictor, no vision — a capacity-matched control for the dual
+        # encoder. Needs no precomputed embeddings (teacher never built/called).
+        self.no_dino = getattr(configs, 'no_dino', False)
+        # DINO-DIRECT ablation: single student encoder, but the frozen DINO
+        # embedding is injected directly into the fusion/forecast head instead of
+        # being a JEPA distillation target. DINO is a live input (train AND test).
+        self.dino_direct = getattr(configs, 'dino_direct', False)
         
         print("\n" + "="*50)
         print("Initializing JEPAVTS Model")
-        if self.use_dual_encoder:
+        if self.no_dino:
+            print("Architecture: NO DINO (dual encoders, no teacher/JEPA) 🚫")
+        elif self.dino_direct:
+            print("Architecture: DINO DIRECT (single encoder + DINO into fusion head) 🎯")
+        elif self.use_dual_encoder:
             print("Architecture: DUAL ENCODER 🔀")
         else:
             print("Architecture: SINGLE ENCODER →")
@@ -306,6 +318,11 @@ class Model(nn.Module):
         self.data = getattr(configs, 'data')
         self.rendering_methods = getattr(configs, 'rendering_methods', None)
         self.per_var_teacher = getattr(configs, 'per_var_teacher', False)
+        if self.no_dino:
+            # NO-DINO: never build/query the teacher. Force teacher-related state
+            # off so downstream code (encoding-type detection, forward) is safe.
+            self.per_var_teacher = False
+            self.rendering_methods = None
 
         # Channel-independent TimesNet for classification: TimesNet mixes channels
         # in its embedding (Conv1d: enc_in -> d_model), so it has no native
@@ -326,7 +343,14 @@ class Model(nn.Module):
         if self.per_var_teacher:
             print("✅ Per-variable teacher mode: each variable gets its own DINO embedding")
         
-        if self.rendering_methods and len(self.rendering_methods) > 0:
+        if self.no_dino:
+            # NO-DINO ablation: no teacher at all.
+            self.multi_rendering = False
+            self.num_renderings = 1
+            self.teacher = None
+            self.teacher_dim = 768  # placeholder, unused (no predictor)
+            print("📊 Skipping teacher (NO-DINO ablation)")
+        elif self.rendering_methods and len(self.rendering_methods) > 0:
             # Multi-rendering mode: one teacher per rendering method
             self.multi_rendering = True
             self.num_renderings = len(self.rendering_methods)
@@ -387,8 +411,10 @@ class Model(nn.Module):
             self.student = self.students_multi[0]  # reference for shape detection & decode
             for method in self.rendering_methods:
                 print(f"✅ Student [{method}]: {student_model_name}")
-        elif self.use_dual_encoder:
-            # 1 forecast encoder + 1 JEPA encoder, fused
+        elif self.use_dual_encoder or self.no_dino:
+            # 1 forecast encoder + 1 JEPA encoder, fused. (NO-DINO uses the same
+            # two encoders + fusion for a capacity-matched control; the JEPA
+            # branch is simply not trained against a teacher.)
             print(f"\n🎓 Building dual encoder (forecast + JEPA)...")
             self.student = self._build_student_model(student_model_name, configs)
             self.student1 = self._build_student_model(student_model_name, configs)
@@ -402,6 +428,19 @@ class Model(nn.Module):
             self.student = self._build_student_model(student_model_name, configs)
         self.student_dim = configs.d_model
         print(f"✅ Student dimension: {self.student_dim}")
+
+        # DINO-DIRECT: project the frozen DINO embedding to d_model and fuse it
+        # with the single student's encoding (DINO as a live second stream).
+        if self.dino_direct:
+            self.dino_projector = nn.Sequential(
+                nn.Linear(self.teacher_dim, configs.d_model),
+                nn.LayerNorm(configs.d_model),
+                nn.GELU(),
+            )
+            self.dino_fusion_module = EncodingFusion(
+                d_model=configs.d_model, num_inputs=2, fusion_type=fusion_type)
+            print(f"✅ DINO-DIRECT projector: {self.teacher_dim} -> {configs.d_model}")
+            print(f"✅ DINO-DIRECT fusion: {fusion_type} (student ⊕ DINO)")
 
         # Calculate encoding shape dynamically based on student model type
         student_model_name = getattr(configs, 'student_model', 'PatchTST')
@@ -474,7 +513,11 @@ class Model(nn.Module):
             getattr(configs, 'multi_predictor', False) and self.multi_rendering
         )
         
-        if self.use_multi_predictor:
+        if self.no_dino or self.dino_direct:
+            # NO-DINO / DINO-DIRECT ablations: no JEPA predictor at all.
+            self.predictor = None
+            print("\n🔗 Skipping JEPA predictor (ablation: no JEPA distillation)")
+        elif self.use_multi_predictor:
             # One predictor per rendering method (separate z'_x per rendering)
             print(f"\n🔗 Building {self.num_renderings} JEPA predictors (one per rendering)...")
             self.predictors = nn.ModuleList([
@@ -730,6 +773,79 @@ class Model(nn.Module):
         
         return forecast_output
     
+    def _dino_embedding(self, x_enc):
+        """Global (per-sample) frozen DINO vector [B, teacher_dim] for DINO-DIRECT.
+
+        Handles multi-rendering (averages across renderings) and per-variable
+        teachers (mean-pools over the variable axis) so the result is a single
+        [B, teacher_dim] vector regardless of teacher configuration.
+        """
+        emb = self.teacher_forward(x_enc)          # tensor or list (multi-rendering)
+        if isinstance(emb, list):
+            emb = torch.stack(emb, dim=0).mean(dim=0)
+        if emb.dim() == 3:                          # per-var [B, N, teacher_dim]
+            emb = emb.mean(dim=1)                   # -> [B, teacher_dim]
+        return emb
+
+    def student_forward_dino_direct(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
+        """
+        DINO-DIRECT forecast (single student): inject the frozen DINO embedding
+        directly into the fusion/forecast head (no JEPA distillation). DINO is a
+        live input, so it is computed here at BOTH train and inference. Returns
+        (forecast, None) when return_all so the loop knows there is no JEPA loss.
+        """
+        dino_proj = self.dino_projector(self._dino_embedding(x_enc))  # [B, d_model]
+
+        if self.encoding_type == '4D_timemixer':
+            jepa_enc, enc_list, x_list, B = self._timemixer_encode(
+                self.student, x_enc, x_mark_enc, x_dec, x_mark_dec)
+            N, D, T = jepa_enc.shape[1], jepa_enc.shape[2], jepa_enc.shape[3]
+            dino_enc = dino_proj.view(B, 1, D, 1).expand(B, N, D, T)
+            combined_encoding = self.dino_fusion_module(jepa_enc, dino_enc)
+            fused_enc_list = self._inject_fused_into_enc_list(enc_list, combined_encoding, B)
+            forecast_output = self.student.forecast_decode(B, fused_enc_list, x_list)
+            if return_all:
+                return forecast_output, None
+            return forecast_output
+
+        student_encoding, means, stdev = self.student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        Np, D = student_encoding.shape[1], student_encoding.shape[2]
+        dino_enc = dino_proj.unsqueeze(1).expand(-1, Np, D)   # [B, N', d_model]
+        combined_encoding = self.dino_fusion_module(student_encoding, dino_enc)
+        forecast_output = self.student.forecast_decode(combined_encoding, means, stdev)
+        if return_all:
+            return forecast_output, None
+        return forecast_output
+
+    def student_forward_no_dino(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
+        """
+        NO-DINO forecast: two student encoders fused, then decode. Task loss only
+        (no teacher, no predictor, no JEPA). Same fuse+decode as the dual encoder,
+        just without the teacher-alignment branch. Returns (forecast, None) when
+        return_all so the training loop can detect 'no JEPA loss'.
+        """
+        if self.encoding_type == '4D_timemixer':
+            jepa_enc1, enc_list1, x_list1, B1 = self._timemixer_encode(
+                self.student1, x_enc, x_mark_enc, x_dec, x_mark_dec)
+            jepa_enc2, enc_list2, x_list2, B2 = self._timemixer_encode(
+                self.student2, x_enc, x_mark_enc, x_dec, x_mark_dec)
+            combined_encoding = self.encoder_fusion(jepa_enc1, jepa_enc2)
+            fused_enc_list = self._inject_fused_into_enc_list(enc_list1, combined_encoding, B1)
+            forecast_output = self.student1.forecast_decode(B1, fused_enc_list, x_list1)
+            if return_all:
+                return forecast_output, None
+            return forecast_output
+
+        student_encoding1, means1, stdev1 = self.student1.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        student_encoding2, means2, stdev2 = self.student2.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
+
+        combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
+        forecast_output = self.student1.forecast_decode(combined_encoding, means1, stdev1)
+
+        if return_all:
+            return forecast_output, None
+        return forecast_output
+
     def student_forward_multi_encoder(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
         """
         Multi-encoder forward: k student encoders, fused for decode.
@@ -999,6 +1115,12 @@ class Model(nn.Module):
                     x_enc, padding_mask, return_all=self.training)
         
         # Forecasting task
+        if self.no_dino:
+            return self.student_forward_no_dino(
+                x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=self.training)
+        if self.dino_direct:
+            return self.student_forward_dino_direct(
+                x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=self.training)
         if self.use_multi_encoder and self.use_dual_encoder:
             return self.student_forward_multi_dual(
                 x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=self.training)
