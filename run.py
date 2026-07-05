@@ -153,6 +153,16 @@ if __name__ == '__main__':
                         help='JEPA loss type: mse or cosine')
     parser.add_argument('--use_dual_encoder', action='store_true', default=False,
                     help='Use dual encoder architecture (one for prediction, one for JEPA)')
+    parser.add_argument('--no_dino', action='store_true', default=False,
+                    help='NO-DINO ablation: dual student encoders fused, task loss only '
+                         '(no teacher / no JEPA / no vision). Capacity control for '
+                         '--use_dual_encoder; needs no precomputed embeddings.')
+    parser.add_argument('--dino_direct', action='store_true', default=False,
+                    help='DINO-DIRECT ablation (single encoder): inject the frozen DINO '
+                         'embedding directly into the fusion/forecast head (no JEPA '
+                         'distillation, task loss only). DINO is a live input, so it is '
+                         'required at BOTH train and inference (needs embeddings for the '
+                         'evaluated dataset too).')
     parser.add_argument('--fusion_type', type=str, default='mlp',
                         choices=['add', 'weighted', 'mlp','transformer'],
                         help='How to fuse dual encoders: add, weighted, or mlp')
