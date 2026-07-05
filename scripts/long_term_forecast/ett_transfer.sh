@@ -222,9 +222,10 @@ for seed in $SEEDS; do
       echo "[eval] MISSING source checkpoint for $tag (dm$d_model df$d_ff) — skipping $src->$tgt pl$pred seed$seed"
       continue
     fi
+    dtag="single"; [ "$USE_DUAL" = "1" ] && dtag="dual"
     eval_id="zsEVAL_${MODEL}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
-    [ "$MODEL" = "JEPAVTS" ] && eval_id="zsEVAL_${MODEL}_${STUDENT}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
-    echo "[eval] $src -> $tgt  pl$pred  seed$seed  (ckpt: $ckpt)"
+    [ "$MODEL" = "JEPAVTS" ] && eval_id="zsEVAL_${MODEL}_${STUDENT}_${dtag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
+    echo "[eval] $src -> $tgt  pl$pred  seed$seed  $dtag  (ckpt: $ckpt)"
     CUDA_VISIBLE_DEVICES=$GPU python -u run.py \
       --task_name long_term_forecast \
       --is_training 0 \
