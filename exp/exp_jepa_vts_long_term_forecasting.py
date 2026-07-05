@@ -158,7 +158,12 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         
         # Get model reference for architecture check
         model_ref = self.model.module if hasattr(self.model, 'module') else self.model
-        arch_type = 'DUAL ENCODER' if model_ref.use_dual_encoder else 'SINGLE ENCODER'
+        if getattr(model_ref, 'no_dino', False):
+            arch_type = 'NO DINO (dual, no teacher/JEPA)'
+        elif getattr(model_ref, 'dino_direct', False):
+            arch_type = 'DINO DIRECT (single + DINO into head)'
+        else:
+            arch_type = 'DUAL ENCODER' if model_ref.use_dual_encoder else 'SINGLE ENCODER'
         rendering_info = (f"Multi-rendering {model_ref.rendering_methods} "
                           f"(alpha_mode={model_ref.multi_rendering_alpha_mode})"
                           if model_ref.multi_rendering
@@ -195,13 +200,23 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 
-                # 1. Teacher forward (frozen, no grad)
-                teacher_encoding = model_ref.teacher_forward(batch_x)
+                # 1. Teacher forward (frozen, no grad). NO-DINO builds no teacher;
+                #    DINO-DIRECT calls the teacher itself inside forward. Either
+                #    way the exp-level teacher/JEPA loss is not used.
+                no_jepa = getattr(model_ref, 'no_dino', False) or getattr(model_ref, 'dino_direct', False)
+                if no_jepa:
+                    teacher_encoding = None
+                else:
+                    teacher_encoding = model_ref.teacher_forward(batch_x)
                 
                 # 2. Student forward - handle all architectures
                 model_outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 
-                if model_ref.use_multi_encoder:
+                if no_jepa:
+                    # NO-DINO / DINO-DIRECT: (predictions, None) - task loss only.
+                    predictions = model_outputs[0]
+                    predicted_teacher_encoding = None
+                elif model_ref.use_multi_encoder:
                     # Multi-encoder: (predictions, student_encodings_list, predicted_list)
                     predictions = model_outputs[0]
                     predicted_teacher_encoding = model_outputs[2]
@@ -221,11 +236,17 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                 true_outputs = batch_y[:, -self.args.pred_len:, f_dim:]
                 pred_loss = criterion(pred_outputs, true_outputs)
                 
-                # 4. JEPA alignment loss (handles both single & multi-rendering)
-                jepa_loss_term, individual_jepa_losses = self._compute_jepa_loss_term(
-                    predicted_teacher_encoding, teacher_encoding,
-                    jepa_loss_type, jepa_weight, model_ref)
-                jepa_loss_scalar = sum(l.item() for l in individual_jepa_losses)
+                # 4. JEPA alignment loss (handles both single & multi-rendering).
+                #    NO-DINO: no teacher/predictor -> skip JEPA entirely.
+                if predicted_teacher_encoding is None:
+                    jepa_loss_term = 0.0
+                    individual_jepa_losses = []
+                    jepa_loss_scalar = 0.0
+                else:
+                    jepa_loss_term, individual_jepa_losses = self._compute_jepa_loss_term(
+                        predicted_teacher_encoding, teacher_encoding,
+                        jepa_loss_type, jepa_weight, model_ref)
+                    jepa_loss_scalar = sum(l.item() for l in individual_jepa_losses)
                 
                 # 5. Combined loss
                 if model_ref.use_learned_loss_weights and predicted_teacher_encoding is not None:
