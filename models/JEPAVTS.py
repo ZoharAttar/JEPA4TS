@@ -516,6 +516,9 @@ class Model(nn.Module):
             if self.encoding_type == '4D':
                 # PatchTST: [B, nvars, d_model, patch_num]
                 flatten_dim = configs.enc_in * configs.d_model * self.patch_num
+            elif self.encoding_type == 'itransformer':
+                # iTransformer: [B, nvars, d_model, 1] (one token per variable)
+                flatten_dim = configs.enc_in * configs.d_model
             elif self.encoding_type == '3D':
                 # TimesNet: [B, T, d_model]
                 flatten_dim = configs.seq_len * configs.d_model
@@ -863,6 +866,14 @@ class Model(nn.Module):
             D = enc.shape[-1]
             enc = enc.reshape(B, N, T, D).permute(0, 1, 3, 2)  # [B, N, d_model, T]
             return enc
+        if self.student_model_name == 'iTransformer':
+            # iTransformer is inverted: classification_encode returns one token
+            # per variable [B, N, d_model]. Add a trailing patch dim so it reuses
+            # the 4D per-var predictor / fusion / classification head machinery
+            # (patch_num=1). Each variable token then aligns with its own DINO
+            # per-variable teacher embedding.
+            enc = student.classification_encode(x_enc, None)  # [B, N, d_model]
+            return enc.unsqueeze(-1)                          # [B, N, d_model, 1]
         return student.encode(x_enc)
 
     def classification_forward(self, x_enc, padding_mask=None, return_all=False):
