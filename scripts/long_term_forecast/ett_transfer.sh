@@ -55,6 +55,14 @@ SEQ_LEN="${SEQ_LEN:-96}"
 LABEL_LEN="${LABEL_LEN:-0}"
 PRED_LENS="${PRED_LENS:-96 192 336 720}"
 
+# Multi-seed sweep. Each seed trains its OWN source models and gets its OWN
+# checkpoints/results (tag suffix _s<seed>), so you can average mean±std across
+# seeds. BASE_SEED is the seed the all-datasets scripts used (2021, hard-coded
+# before); with REUSE_TRAINED=1 that one seed reuses those existing checkpoints
+# (no _s suffix) instead of retraining. Set SEEDS="2021" for a single-seed run.
+SEEDS="${SEEDS:-2021 2022 2023 2024}"
+BASE_SEED="${BASE_SEED:-2021}"
+
 # Transfer pairs (source:target) from Table 6.
 PAIRS="${PAIRS:-ETTh1:ETTh2 ETTh1:ETTm2 ETTh2:ETTh1 ETTm1:ETTh2 ETTm1:ETTm2 ETTm2:ETTm1}"
 
@@ -101,14 +109,18 @@ ds_file() { echo "$1.csv"; }
 # (always train fresh, isolated from your main runs).
 REUSE_TRAINED="${REUSE_TRAINED:-1}"
 src_tag() {
-  local src=$1 pred=$2
+  local src=$1 pred=$2 seed=$3
   local dtag="single"; [ "$USE_DUAL" = "1" ] && dtag="dual"
+  # Seed suffix, EXCEPT for BASE_SEED with REUSE_TRAINED (reuse seedless ckpts
+  # already trained by the all-datasets scripts, which used the base seed).
+  local sfx="_s${seed}"
+  if [ "$REUSE_TRAINED" = "1" ] && [ "$seed" = "$BASE_SEED" ]; then sfx=""; fi
   if [ "$MODEL" = "JEPAVTS" ] && [ "$REUSE_TRAINED" = "1" ]; then
-    echo "${src}_${RENDER}_${SEQ_LEN}_${pred}_${dtag}"
+    echo "${src}_${RENDER}_${SEQ_LEN}_${pred}_${dtag}${sfx}"
   elif [ "$MODEL" = "JEPAVTS" ]; then
-    echo "zsT_${MODEL}_${STUDENT}_${RENDER}_${dtag}_${src}_${SEQ_LEN}_${pred}"
+    echo "zsT_${MODEL}_${STUDENT}_${RENDER}_${dtag}_${src}_${SEQ_LEN}_${pred}${sfx}"
   else
-    echo "zsT_${MODEL}_${src}_${SEQ_LEN}_${pred}"
+    echo "zsT_${MODEL}_${src}_${SEQ_LEN}_${pred}${sfx}"
   fi
 }
 
@@ -145,20 +157,24 @@ find_ckpt() {
 # 1) Train every unique SOURCE (dataset, pred_len) once, using SOURCE config.
 # ---------------------------------------------------------------------------
 sources=$(for p in $PAIRS; do echo "${p%%:*}"; done | sort -u)
+echo ">>> Seeds: $SEEDS"
 echo ">>> Sources to train: $sources"
 
-for src in $sources; do
+for seed in $SEEDS; do
+ echo "================ SEED $seed : TRAIN ================"
+ for src in $sources; do
   IFS='|' read -r enc_in e_layers d_model d_ff batch lr epochs patience dropout factor ds_layers <<< "$(get_cfg "$src")" || exit 1
   for pred in $PRED_LENS; do
-    tag="$(src_tag "$src" "$pred")"
+    tag="$(src_tag "$src" "$pred" "$seed")"
     if [ -n "$(find_ckpt "$tag" "$d_model" "$d_ff")" ]; then
       echo "[train] SKIP (checkpoint exists): $tag (dm$d_model df$d_ff)"
       continue
     fi
-    echo "[train] $tag"
+    echo "[train] $tag (seed $seed)"
     CUDA_VISIBLE_DEVICES=$GPU python -u run.py \
       --task_name long_term_forecast \
       --is_training 1 \
+      --seed "$seed" \
       --root_path "$(ds_root "$src")" \
       --data_path "$(ds_file "$src")" \
       --model_id "$tag" \
@@ -186,29 +202,33 @@ for src in $sources; do
       echo "[train] FAIL: $tag -> see $LOG_DIR/train_${tag}.log"
     fi
   done
+ done
 done
 
 # ---------------------------------------------------------------------------
 # 2) Evaluate each (source -> target) pair on the TARGET test split, loading
 #    the SOURCE checkpoint (no retraining). Architecture uses the SOURCE config.
 # ---------------------------------------------------------------------------
-for pair in $PAIRS; do
+for seed in $SEEDS; do
+ echo "================ SEED $seed : EVAL ================"
+ for pair in $PAIRS; do
   src="${pair%%:*}"
   tgt="${pair##*:}"
   IFS='|' read -r enc_in e_layers d_model d_ff batch lr epochs patience dropout factor ds_layers <<< "$(get_cfg "$src")" || exit 1
   for pred in $PRED_LENS; do
-    tag="$(src_tag "$src" "$pred")"
+    tag="$(src_tag "$src" "$pred" "$seed")"
     ckpt="$(find_ckpt "$tag" "$d_model" "$d_ff")"
     if [ -z "$ckpt" ]; then
-      echo "[eval] MISSING source checkpoint for $tag (dm$d_model df$d_ff) — skipping $src->$tgt pl$pred"
+      echo "[eval] MISSING source checkpoint for $tag (dm$d_model df$d_ff) — skipping $src->$tgt pl$pred seed$seed"
       continue
     fi
-    eval_id="zsEVAL_${MODEL}_${src}2${tgt}_${SEQ_LEN}_${pred}"
-    [ "$MODEL" = "JEPAVTS" ] && eval_id="zsEVAL_${MODEL}_${STUDENT}_${src}2${tgt}_${SEQ_LEN}_${pred}"
-    echo "[eval] $src -> $tgt  pl$pred   (ckpt: $ckpt)"
+    eval_id="zsEVAL_${MODEL}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
+    [ "$MODEL" = "JEPAVTS" ] && eval_id="zsEVAL_${MODEL}_${STUDENT}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
+    echo "[eval] $src -> $tgt  pl$pred  seed$seed  (ckpt: $ckpt)"
     CUDA_VISIBLE_DEVICES=$GPU python -u run.py \
       --task_name long_term_forecast \
       --is_training 0 \
+      --seed "$seed" \
       --transfer_checkpoint "$ckpt" \
       --root_path "$(ds_root "$tgt")" \
       --data_path "$(ds_file "$tgt")" \
@@ -234,6 +254,8 @@ for pair in $PAIRS; do
       echo "[eval] FAIL: $eval_id -> see $LOG_DIR/eval_${eval_id}.log"
     fi
   done
+ done
 done
 
-echo "Done. Per-pair MSE/MAE are in result_*.txt; average the 4 pred_len rows per pair for Table-6 numbers."
+echo "Done. Per-pair MSE/MAE (one row per seed, tagged _s<seed>) are in result_*.txt;"
+echo "average the 4 pred_len rows per pair, then take mean±std across the $(echo $SEEDS | wc -w) seeds."
