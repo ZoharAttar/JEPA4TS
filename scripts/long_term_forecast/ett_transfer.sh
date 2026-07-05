@@ -25,11 +25,17 @@
 # Average the 4 pred_len rows per pair for the Table-6 numbers.
 #
 # PREREQUISITE (JEPAVTS only): per-variable DINO embeddings for the SOURCE
-# datasets must be precomputed (target eval needs NONE — JEPAVTS test runs only
-# the student forecast path):
+# datasets must be precomputed (standard JEPA / NO-DINO target eval needs NONE —
+# test runs only the student forecast path):
 #   for d in ETTh1 ETTh2 ETTm1 ETTm2; do
 #     python utils/precompute_embeddings_pervar.py --dataset $d --method RP
 #   done
+#   EXCEPTION — DINO_DIRECT=1: DINO is a live input, so the TARGET datasets also
+#   need precomputed <RENDER> embeddings (precompute all four ETT datasets).
+#
+# ABLATION SWITCHES (env vars):
+#   USE_DUAL=1 | NO_DINO=1 | DINO_DIRECT=1   (pick architecture)
+#   FUSION=mlp|transformer|weighted|add       (fusion head; default mlp)
 # ═══════════════════════════════════════════════════════════════════════════
 
 GPU="${GPU:-0}"
@@ -41,6 +47,19 @@ MODEL="${MODEL:-JEPAVTS}"
 STUDENT="${STUDENT:-TimeMixer}"      # only used when MODEL=JEPAVTS
 RENDER="${RENDER:-RP}"               # only used when MODEL=JEPAVTS (must be precomputed)
 USE_DUAL="${USE_DUAL:-0}"            # JEPAVTS: 1 -> --use_dual_encoder --fusion_type mlp
+# NO-DINO ablation: 1 -> two student encoders fused, task loss only (no teacher /
+# no JEPA / no vision). Needs NO precomputed embeddings (source OR target). This
+# is the capacity-matched control for the dual encoder. Ignores RENDER/USE_DUAL.
+NO_DINO="${NO_DINO:-0}"
+# DINO-DIRECT ablation: 1 -> single student encoder + frozen DINO injected into
+# the fusion/forecast head (no JEPA distillation). DINO is a LIVE input, so it is
+# needed at train AND eval -> requires precomputed <RENDER> per-var embeddings for
+# BOTH source and TARGET datasets. Ignores USE_DUAL.
+DINO_DIRECT="${DINO_DIRECT:-0}"
+# Fusion-type ablation: how the two streams are combined in the fusion head.
+# Applies to DINO-DIRECT (student ⊕ DINO), NO-DINO and dual encoder (student ⊕
+# student). One of: mlp | transformer | weighted | add. Default mlp.
+FUSION="${FUSION:-mlp}"
 
 # TimeMixer-only knobs (it REQUIRES multi-scale downsampling; encode() iterates
 # over a list of scales). ds_layers is taken per-dataset from get_cfg below.
@@ -110,15 +129,31 @@ ds_file() { echo "$1.csv"; }
 REUSE_TRAINED="${REUSE_TRAINED:-1}"
 src_tag() {
   local src=$1 pred=$2 seed=$3
+  # Fusion suffix: only added for non-default fusion so existing mlp checkpoints /
+  # result ids stay backward-compatible. Applies to all fused JEPAVTS arches.
+  local ftag=""; [ "$FUSION" != "mlp" ] && ftag="_${FUSION}"
+  # NO-DINO / DINO-DIRECT are distinct architectures, so they never reuse the JEPA
+  # all-datasets checkpoints — always their own seeded tag, trained fresh.
+  if [ "$DINO_DIRECT" = "1" ]; then
+    echo "zsT_dinodirect_${STUDENT}${ftag}_${src}_${SEQ_LEN}_${pred}_s${seed}"
+    return
+  fi
+  if [ "$NO_DINO" = "1" ]; then
+    echo "zsT_nodino_${STUDENT}${ftag}_${src}_${SEQ_LEN}_${pred}_s${seed}"
+    return
+  fi
   local dtag="single"; [ "$USE_DUAL" = "1" ] && dtag="dual"
+  # Non-mlp fusion only changes anything for the dual encoder (single encoder has
+  # no fusion), and it never matches the pretrained mlp checkpoints.
+  [ "$dtag" = "single" ] && ftag=""
   # Seed suffix, EXCEPT for BASE_SEED with REUSE_TRAINED (reuse seedless ckpts
   # already trained by the all-datasets scripts, which used the base seed).
   local sfx="_s${seed}"
   if [ "$REUSE_TRAINED" = "1" ] && [ "$seed" = "$BASE_SEED" ]; then sfx=""; fi
-  if [ "$MODEL" = "JEPAVTS" ] && [ "$REUSE_TRAINED" = "1" ]; then
+  if [ "$MODEL" = "JEPAVTS" ] && [ "$REUSE_TRAINED" = "1" ] && [ -z "$ftag" ]; then
     echo "${src}_${RENDER}_${SEQ_LEN}_${pred}_${dtag}${sfx}"
   elif [ "$MODEL" = "JEPAVTS" ]; then
-    echo "zsT_${MODEL}_${STUDENT}_${RENDER}_${dtag}_${src}_${SEQ_LEN}_${pred}${sfx}"
+    echo "zsT_${MODEL}_${STUDENT}_${RENDER}_${dtag}${ftag}_${src}_${SEQ_LEN}_${pred}${sfx}"
   else
     echo "zsT_${MODEL}_${src}_${SEQ_LEN}_${pred}${sfx}"
   fi
@@ -128,9 +163,24 @@ src_tag() {
 model_flags() {
   local ds_layers=$1
   local flags=""
-  if [ "$MODEL" = "JEPAVTS" ]; then
+  if [ "$MODEL" = "JEPAVTS" ] && [ "$DINO_DIRECT" = "1" ]; then
+    # DINO-DIRECT ablation: single student + DINO injected into the fusion head.
+    # Keeps the teacher (per-var, single rendering) — needs embeddings at train
+    # AND eval. No JEPA flags.
+    flags="--model JEPAVTS --student_model $STUDENT --dino_direct --per_var_teacher --rendering_methods $RENDER --fusion_type $FUSION"
+    if [ "$STUDENT" = "TimeMixer" ]; then
+      flags="$flags --down_sampling_layers $ds_layers --down_sampling_method $DS_METHOD --down_sampling_window $DS_WINDOW --timemixer_jepa_scale $JEPA_SCALE"
+    fi
+  elif [ "$MODEL" = "JEPAVTS" ] && [ "$NO_DINO" = "1" ]; then
+    # NO-DINO ablation: dual student encoders, task loss only. No teacher flags
+    # (--per_var_teacher / --rendering_methods / --jepa_*), no precompute needed.
+    flags="--model JEPAVTS --student_model $STUDENT --no_dino --fusion_type $FUSION"
+    if [ "$STUDENT" = "TimeMixer" ]; then
+      flags="$flags --down_sampling_layers $ds_layers --down_sampling_method $DS_METHOD --down_sampling_window $DS_WINDOW --timemixer_jepa_scale $JEPA_SCALE"
+    fi
+  elif [ "$MODEL" = "JEPAVTS" ]; then
     local extra=""
-    [ "$USE_DUAL" = "1" ] && extra="--use_dual_encoder --fusion_type mlp"
+    [ "$USE_DUAL" = "1" ] && extra="--use_dual_encoder --fusion_type $FUSION"
     flags="--model JEPAVTS --student_model $STUDENT --per_var_teacher --rendering_methods $RENDER --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS $extra"
     if [ "$STUDENT" = "TimeMixer" ]; then
       flags="$flags --down_sampling_layers $ds_layers --down_sampling_method $DS_METHOD --down_sampling_window $DS_WINDOW --timemixer_jepa_scale $JEPA_SCALE"
@@ -223,8 +273,14 @@ for seed in $SEEDS; do
       continue
     fi
     dtag="single"; [ "$USE_DUAL" = "1" ] && dtag="dual"
+    # Fusion suffix in the result id (non-default only), so fusion-type ablation
+    # variants land in distinct result rows.
+    eftag=""; [ "$FUSION" != "mlp" ] && eftag="_${FUSION}"
+    dual_eftag="$eftag"; [ "$dtag" = "single" ] && dual_eftag=""
     eval_id="zsEVAL_${MODEL}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
-    [ "$MODEL" = "JEPAVTS" ] && eval_id="zsEVAL_${MODEL}_${STUDENT}_${dtag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
+    [ "$MODEL" = "JEPAVTS" ] && eval_id="zsEVAL_${MODEL}_${STUDENT}_${dtag}${dual_eftag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
+    [ "$NO_DINO" = "1" ] && eval_id="zsEVAL_JEPAVTS_nodino_${STUDENT}${eftag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
+    [ "$DINO_DIRECT" = "1" ] && eval_id="zsEVAL_JEPAVTS_dinodirect_${STUDENT}${eftag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
     echo "[eval] $src -> $tgt  pl$pred  seed$seed  $dtag  (ckpt: $ckpt)"
     CUDA_VISIBLE_DEVICES=$GPU python -u run.py \
       --task_name long_term_forecast \
