@@ -465,6 +465,17 @@ class Model(nn.Module):
             patch_num = 1
             self.encoding_type = 'itransformer'
             predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
+        elif student_model_name == 'Crossformer':
+            # Crossformer natively keeps a per-variable axis. Its
+            # classification_encode returns [B, N, out_seg_num, d_model]; _encode_cls
+            # permutes it to the 4D convention [B, N, d_model, out_seg_num] so it
+            # reuses the per-var predictor / fusion / native-head machinery
+            # (exactly like PatchTST's 4D, with patch_num = out_seg_num). Each
+            # variable's [d_model, out_seg_num] token aligns with its own DINO
+            # per-variable teacher embedding.
+            patch_num = self.student.out_seg_num
+            self.encoding_type = '4D'  # [B, nvars, d_model, out_seg_num]
+            predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
         elif student_model_name == 'TimeMixer':
             patch_num = None
             self.timemixer_jepa_scale = getattr(configs, 'timemixer_jepa_scale', 'fine')
@@ -565,7 +576,7 @@ class Model(nn.Module):
             # makes JEPAVTS a clean "+JEPA on the same model" (same head as the
             # baseline), exactly like forecasting reuses forecast_decode. Backbones
             # without a compatible native decode fall back to the generic head.
-            self.use_native_cls_head = (self.student_model_name == 'iTransformer')
+            self.use_native_cls_head = self.student_model_name in ('iTransformer', 'Crossformer')
             if self.use_native_cls_head:
                 print("✅ Classification head: NATIVE backbone "
                       f"({self.student_model_name}.classification_decode)")
@@ -1005,6 +1016,14 @@ class Model(nn.Module):
             # per-variable teacher embedding.
             enc = student.classification_encode(x_enc, None)  # [B, N, d_model]
             return enc.unsqueeze(-1)                          # [B, N, d_model, 1]
+        if self.student_model_name == 'Crossformer':
+            # Crossformer.classification_encode returns the last encoder feature
+            # map [B, N, out_seg_num, d_model]. Permute to the 4D convention
+            # [B, N, d_model, out_seg_num] so it reuses the per-var predictor /
+            # fusion / native-head machinery. Each variable's [d_model, seg_num]
+            # token aligns with its own DINO per-variable teacher embedding.
+            enc = student.classification_encode(x_enc, None)  # [B, N, seg_num, d_model]
+            return enc.permute(0, 1, 3, 2)                    # [B, N, d_model, seg_num]
         return student.encode(x_enc)
 
     def _cls_logits(self, encoding, owner):
@@ -1017,6 +1036,12 @@ class Model(nn.Module):
         """
         if self.use_native_cls_head:
             enc = encoding
+            if self.student_model_name == 'Crossformer':
+                # 4D JEPA/fusion view [B, N, d_model, seg_num] -> native
+                # [B, N, seg_num, d_model] expected by classification_decode.
+                if enc.dim() == 4:
+                    enc = enc.permute(0, 1, 3, 2)
+                return owner.classification_decode(enc)
             if enc.dim() == 4 and enc.shape[-1] == 1:
                 enc = enc.squeeze(-1)  # [B, N, d_model, 1] -> [B, N, d_model]
             return owner.classification_decode(enc)
