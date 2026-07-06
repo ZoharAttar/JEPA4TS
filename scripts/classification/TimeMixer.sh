@@ -17,6 +17,12 @@ D_MODEL="${D_MODEL:-16}"
 D_FF="${D_FF:-32}"
 E_LAYERS="${E_LAYERS:-3}"
 
+# MUST be 0 for classification: TimeMixer.classification() embeds the full
+# multivariate series [B,T,N] directly (it does NOT fold variables into the
+# batch like the forecast path). With channel_independence=1 the embedding is
+# built for 1 channel and crashes on N-channel input.
+CHANNEL_INDEPENDENCE="${CHANNEL_INDEPENDENCE:-0}"
+
 # enc_in / seq_len / num_class are auto-set from the data in exp_classification.py,
 # so --enc_in below is only a placeholder (ignored/overridden).
 DATASETS="${DATASETS:-EthanolConcentration FaceDetection Handwriting Heartbeat JapaneseVowels PEMS-SF SelfRegulationSCP1 SelfRegulationSCP2 SpokenArabicDigits UWaveGestureLibrary}"
@@ -37,6 +43,7 @@ for name in $DATASETS; do
     --down_sampling_layers $DS_LAYERS \
     --down_sampling_window $DS_WINDOW \
     --down_sampling_method $DS_METHOD \
+    --channel_independence $CHANNEL_INDEPENDENCE \
     --des 'Exp' \
     --itr 1 \
     --learning_rate 0.001 \
