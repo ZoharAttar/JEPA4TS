@@ -114,20 +114,30 @@ class Model(nn.Module):
         dec_out = self.head(enc_out[-1].permute(0, 1, 3, 2)).permute(0, 2, 1)
         return dec_out
 
-    def classification(self, x_enc, x_mark_enc):
-        # embedding
+    def classification_encode(self, x_enc, x_mark_enc):
+        # Behavior-preserving split of classification(): runs the DSW embedding +
+        # two-stage-attention encoder and returns the LAST encoder feature map so
+        # JEPAVTS can align each variable with its per-variable teacher embedding.
+        # x_mark_enc is unused (kept for signature symmetry with classification()).
         x_enc, n_vars = self.enc_value_embedding(x_enc.permute(0, 2, 1))
 
         x_enc = rearrange(x_enc, '(b d) seg_num d_model -> b d seg_num d_model', d=n_vars)
         x_enc += self.enc_pos_embedding
         x_enc = self.pre_norm(x_enc)
         enc_out, attns = self.encoder(x_enc)
-        # Output from Non-stationary Transformer
-        output = self.flatten(enc_out[-1].permute(0, 1, 3, 2))
+        return enc_out[-1]  # (batch, n_vars, out_seg_num, d_model)
+
+    def classification_decode(self, enc_last):
+        # Tail of classification(): maps the last encoder feature map to logits.
+        output = self.flatten(enc_last.permute(0, 1, 3, 2))
         output = self.dropout(output)
         output = output.reshape(output.shape[0], -1)
         output = self.projection(output)
         return output
+
+    def classification(self, x_enc, x_mark_enc):
+        enc_last = self.classification_encode(x_enc, x_mark_enc)
+        return self.classification_decode(enc_last)
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
