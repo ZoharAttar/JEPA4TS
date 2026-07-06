@@ -293,6 +293,11 @@ class Model(nn.Module):
         # embedding is injected directly into the fusion/forecast head instead of
         # being a JEPA distillation target. DINO is a live input (train AND test).
         self.dino_direct = getattr(configs, 'dino_direct', False)
+        # Classification: use the backbone's OWN classification head (mirrors how
+        # forecasting uses the backbone's forecast_decode) instead of the generic
+        # JEPAVTS head. Set per-backbone below; only backbones that expose a
+        # classification_decode consuming our encoding qualify (iTransformer).
+        self.use_native_cls_head = False
         
         print("\n" + "="*50)
         print("Initializing JEPAVTS Model")
@@ -555,28 +560,38 @@ class Model(nn.Module):
         # Classification head
         if self.task_name == 'classification':
             self.num_classes = configs.num_class
-            # Calculate flatten dimension for classification head based on encoding type
-            if self.encoding_type == '4D':
-                # PatchTST: [B, nvars, d_model, patch_num]
-                flatten_dim = configs.enc_in * configs.d_model * self.patch_num
-            elif self.encoding_type == 'itransformer':
-                # iTransformer: [B, nvars, d_model, 1] (one token per variable)
-                flatten_dim = configs.enc_in * configs.d_model
-            elif self.encoding_type == '3D':
-                # TimesNet: [B, T, d_model]
-                flatten_dim = configs.seq_len * configs.d_model
+            # Prefer the backbone's NATIVE classification head when it exposes a
+            # classification_decode that consumes our encoding (iTransformer). This
+            # makes JEPAVTS a clean "+JEPA on the same model" (same head as the
+            # baseline), exactly like forecasting reuses forecast_decode. Backbones
+            # without a compatible native decode fall back to the generic head.
+            self.use_native_cls_head = (self.student_model_name == 'iTransformer')
+            if self.use_native_cls_head:
+                print("✅ Classification head: NATIVE backbone "
+                      f"({self.student_model_name}.classification_decode)")
             else:
-                flatten_dim = configs.d_model
-            
-            self.classification_head = nn.Sequential(
-                nn.Flatten(start_dim=1),
-                nn.Linear(flatten_dim, configs.d_model),
-                nn.LayerNorm(configs.d_model),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(configs.d_model, self.num_classes)
-            )
-            print(f"✅ Classification head: {flatten_dim} -> {self.num_classes} classes")
+                # Calculate flatten dimension for the generic head by encoding type
+                if self.encoding_type == '4D':
+                    # PatchTST: [B, nvars, d_model, patch_num]
+                    flatten_dim = configs.enc_in * configs.d_model * self.patch_num
+                elif self.encoding_type == 'itransformer':
+                    # iTransformer: [B, nvars, d_model, 1] (one token per variable)
+                    flatten_dim = configs.enc_in * configs.d_model
+                elif self.encoding_type == '3D':
+                    # TimesNet: [B, T, d_model]
+                    flatten_dim = configs.seq_len * configs.d_model
+                else:
+                    flatten_dim = configs.d_model
+
+                self.classification_head = nn.Sequential(
+                    nn.Flatten(start_dim=1),
+                    nn.Linear(flatten_dim, configs.d_model),
+                    nn.LayerNorm(configs.d_model),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(configs.d_model, self.num_classes)
+                )
+                print(f"✅ Classification head: {flatten_dim} -> {self.num_classes} classes")
         
         # Learnable loss weights (uncertainty-based)
         self.use_learned_loss_weights = getattr(configs, 'learned_loss_weights', False)
@@ -992,6 +1007,21 @@ class Model(nn.Module):
             return enc.unsqueeze(-1)                          # [B, N, d_model, 1]
         return student.encode(x_enc)
 
+    def _cls_logits(self, encoding, owner):
+        """Map a (possibly fused) student encoding to class logits.
+
+        Uses the backbone's NATIVE classification head (owner.classification_decode)
+        when available — same head the baseline uses — else the generic JEPAVTS head.
+        `owner` is the student whose native head/weights should decode (the task
+        encoder: self.student / self.student1 / self.student_forecast).
+        """
+        if self.use_native_cls_head:
+            enc = encoding
+            if enc.dim() == 4 and enc.shape[-1] == 1:
+                enc = enc.squeeze(-1)  # [B, N, d_model, 1] -> [B, N, d_model]
+            return owner.classification_decode(enc)
+        return self.classification_head(encoding)
+
     def classification_forward(self, x_enc, padding_mask=None, return_all=False):
         """
         Classification forward pass
@@ -1002,7 +1032,7 @@ class Model(nn.Module):
         # Get student encoding 
         student_encoding = self._encode_cls(self.student, x_enc)
         # Classification output
-        class_logits = self.classification_head(student_encoding)
+        class_logits = self._cls_logits(student_encoding, self.student)
         
         if return_all and self.training:
             # Get JEPA prediction(s) for teacher alignment
@@ -1026,7 +1056,7 @@ class Model(nn.Module):
         combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
         
         # Classification output
-        class_logits = self.classification_head(combined_encoding)
+        class_logits = self._cls_logits(combined_encoding, self.student1)
         
         if return_all and self.training:
             return class_logits, predicted_teacher_encoding
@@ -1052,7 +1082,7 @@ class Model(nn.Module):
         else:
             predicted_teacher = self.predictor(fused_encoding)
         
-        class_logits = self.classification_head(fused_encoding)
+        class_logits = self._cls_logits(fused_encoding, self.student)
         
         if return_all and self.training:
             return class_logits, student_encodings, predicted_teacher
@@ -1077,7 +1107,7 @@ class Model(nn.Module):
 
         all_encs = [fc_encoding] + jepa_encodings
         fused = self.encoder_fusion(all_encs)
-        class_logits = self.classification_head(fused)
+        class_logits = self._cls_logits(fused, self.student_forecast)
 
         if return_all and self.training:
             return class_logits, jepa_encodings, predicted_teacher
