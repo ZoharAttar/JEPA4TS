@@ -8,9 +8,11 @@ Usage:
     python utils/precompute_embeddings_pervar.py --dataset ETTm2 --method GAF
     python utils/precompute_embeddings_pervar.py --dataset weather --method LinePlot
 
+    python utils/precompute_embeddings_pervar.py --dataset exchange_rate --method Spectrogram
+
     # Run all combos:
     for d in ETTh1 ETTh2 ETTm1 ETTm2 weather electricity traffic exchange_rate national_illness; do
-      for m in RP GAF LinePlot; do
+      for m in RP GAF LinePlot Spectrogram; do
         python utils/precompute_embeddings_pervar.py --dataset $d --method $m
       done
     done
@@ -20,6 +22,7 @@ CSV to be present under ./dataset/<name>/ (e.g. electricity, traffic, exchange_r
 """
 
 import os
+import math
 import argparse
 import numpy as np
 import torch
@@ -215,10 +218,81 @@ def transform_lineplot_pervar(x, image_size=518, device=None):
     return torch.stack(all_images).to(device)  # [B, N, 3, H, W]
 
 
+def _apply_matplotlib_cmap(img, cmap_name):
+    """img: [B, 1, H, W] in [0,1]  ->  [B, 3, H, W] in [0,1] via matplotlib cmap."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.cm as cm
+    cmap = cm.get_cmap(cmap_name)
+    arr = img.squeeze(1).detach().cpu().numpy()
+    rgba = cmap(arr)
+    rgb = rgba[..., :3]
+    rgb = torch.from_numpy(rgb).to(img.device, dtype=img.dtype).permute(0, 3, 1, 2)
+    return rgb.contiguous()
+
+
+def transform_spectrogram_pervar(
+    x, image_size=518, device=None,
+    n_fft=None, hop_length=None, win_length=None,
+    log_scale=True, colormap=None,
+):
+    """Per-variable STFT spectrogram. Returns [B, N, 3, H, W] in [0, 1].
+
+    STFT params default adaptively to seq_len; colormap=None -> grayscale
+    replicated to 3 channels. Identical to the classification renderer so the
+    same series produces the same embedding across tasks.
+    """
+    if device is None:
+        device = x.device
+    B, L, N = x.shape
+
+    if n_fft is None:
+        target = max(8, L // 8)
+        n_fft = max(16, min(256, 2 ** int(math.log2(target))))
+    if win_length is None:
+        win_length = min(n_fft, L) if L > 0 else n_fft
+    if hop_length is None:
+        hop_length = max(1, n_fft // 4)
+
+    x_flat = x.permute(0, 2, 1).reshape(B * N, L).to(device).float()
+    if L < n_fft:
+        x_flat = F.pad(x_flat, (0, n_fft - L))
+
+    window = torch.hann_window(win_length, device=device)
+    stft = torch.stft(
+        x_flat,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        center=True,
+        return_complex=True,
+    )
+    mag = stft.abs()
+    if log_scale:
+        mag = torch.log1p(mag)
+
+    mn = mag.amin(dim=(-2, -1), keepdim=True)
+    mx = mag.amax(dim=(-2, -1), keepdim=True)
+    img = (mag - mn) / (mx - mn + 1e-8)
+
+    img = img.unsqueeze(1)
+    img = F.interpolate(img, size=(image_size, image_size),
+                        mode='bilinear', align_corners=False)
+
+    if colormap is None:
+        img = img.expand(-1, 3, -1, -1).contiguous()
+    else:
+        img = _apply_matplotlib_cmap(img, colormap)
+
+    return img.reshape(B, N, 3, image_size, image_size)
+
+
 TRANSFORM_MAP = {
     'GAF': transform_GAF_pervar,
     'RP': transform_RP_pervar,
     'LinePlot': transform_lineplot_pervar,
+    'Spectrogram': transform_spectrogram_pervar,
 }
 
 # ============================================
@@ -246,11 +320,29 @@ def main():
                         help='Keep at 1 for caching by hash; higher only if memory allows')
     parser.add_argument('--dino_batch_size', type=int, default=7,
                         help='Max variables to feed DINO at once (controls GPU memory)')
+    # Spectrogram-only knobs (ignored for other methods). Keep defaults to match
+    # the training-time teacher cache (dino_embeddings_<data>_Spectrogram_pervar).
+    parser.add_argument('--n_fft', type=int, default=0, help='Spectrogram: 0 = adaptive')
+    parser.add_argument('--hop_length', type=int, default=0, help='Spectrogram: 0 = n_fft // 4')
+    parser.add_argument('--win_length', type=int, default=0, help='Spectrogram: 0 = n_fft')
+    parser.add_argument('--no_log', action='store_true', help='Spectrogram: disable log1p')
+    parser.add_argument('--colormap', type=str, default=None,
+                        help='Spectrogram: matplotlib cmap (e.g. viridis); default = grayscale')
     parser.add_argument('--zip', action='store_true', help='Zip cache dir when done')
     cli_args = parser.parse_args()
 
     cfg = DATASET_CONFIGS[cli_args.dataset]
     transform_fn = TRANSFORM_MAP[cli_args.method]
+
+    extra_kwargs = {}
+    if cli_args.method == 'Spectrogram':
+        extra_kwargs = {
+            'n_fft': cli_args.n_fft if cli_args.n_fft > 0 else None,
+            'hop_length': cli_args.hop_length if cli_args.hop_length > 0 else None,
+            'win_length': cli_args.win_length if cli_args.win_length > 0 else None,
+            'log_scale': not cli_args.no_log,
+            'colormap': cli_args.colormap,
+        }
 
     cache_dir = f"{cfg['cache_base']}_{cli_args.method}_pervar"
     os.makedirs(cache_dir, exist_ok=True)
@@ -318,7 +410,8 @@ def main():
 
                     # Transform single sample: [1, seq_len, N] → [1, N, 3, H, W]
                     x_images = transform_fn(
-                        sample.unsqueeze(0), image_size=IMAGE_SIZE, device=DEVICE
+                        sample.unsqueeze(0), image_size=IMAGE_SIZE, device=DEVICE,
+                        **extra_kwargs
                     )
 
                     # Run DINO per variable (chunked to control memory)
