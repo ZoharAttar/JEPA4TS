@@ -147,6 +147,11 @@ src_tag() {
   # Fusion suffix: only added for non-default fusion so existing mlp checkpoints /
   # result ids stay backward-compatible. Applies to all fused JEPAVTS arches.
   local ftag=""; [ "$FUSION" != "mlp" ] && ftag="_${FUSION}"
+  # jepa_weight (lambda) tag: only added for non-default lambda so existing lambda=1
+  # checkpoints/results stay reusable. lambda ONLY affects the standard JEPAVTS path
+  # (it multiplies the JEPA distillation loss); NO-DINO / DINO-DIRECT have no JEPA
+  # loss, so it is intentionally NOT tagged there.
+  local jwtag=""; [ "$JEPA_WEIGHT" != "1" ] && jwtag="_jw${JEPA_WEIGHT}"
   # NO-DINO / DINO-DIRECT are distinct architectures, so they never reuse the JEPA
   # all-datasets checkpoints — always their own seeded tag, trained fresh.
   if [ "$DINO_DIRECT" = "1" ]; then
@@ -165,10 +170,10 @@ src_tag() {
   # already trained by the all-datasets scripts, which used the base seed).
   local sfx="_s${seed}"
   if [ "$REUSE_TRAINED" = "1" ] && [ "$seed" = "$BASE_SEED" ]; then sfx=""; fi
-  if [ "$MODEL" = "JEPAVTS" ] && [ "$REUSE_TRAINED" = "1" ] && [ -z "$ftag" ]; then
+  if [ "$MODEL" = "JEPAVTS" ] && [ "$REUSE_TRAINED" = "1" ] && [ -z "$ftag" ] && [ -z "$jwtag" ]; then
     echo "${src}_${RENDER}_${SEQ_LEN}_${pred}_${dtag}${sfx}"
   elif [ "$MODEL" = "JEPAVTS" ]; then
-    echo "zsT_${MODEL}_${STUDENT}_${RENDER}_${dtag}${ftag}_${src}_${SEQ_LEN}_${pred}${sfx}"
+    echo "zsT_${MODEL}_${STUDENT}_${RENDER}_${dtag}${ftag}${jwtag}_${src}_${SEQ_LEN}_${pred}${sfx}"
   else
     echo "zsT_${MODEL}_${src}_${SEQ_LEN}_${pred}${sfx}"
   fi
@@ -283,8 +288,11 @@ eval_one() {
   # variants land in distinct result rows.
   local eftag=""; [ "$FUSION" != "mlp" ] && eftag="_${FUSION}"
   local dual_eftag="$eftag"; [ "$dtag" = "single" ] && dual_eftag=""
+  # lambda tag (non-default only) so each jepa_weight lands in its own result row /
+  # done-marker. Standard JEPAVTS path only (NO-DINO / DINO-DIRECT have no JEPA loss).
+  local jwtag=""; [ "$JEPA_WEIGHT" != "1" ] && jwtag="_jw${JEPA_WEIGHT}"
   local eval_id="zsEVAL_${MODEL}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
-  [ "$MODEL" = "JEPAVTS" ] && eval_id="zsEVAL_${MODEL}_${STUDENT}_${dtag}${dual_eftag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
+  [ "$MODEL" = "JEPAVTS" ] && eval_id="zsEVAL_${MODEL}_${STUDENT}_${dtag}${dual_eftag}${jwtag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
   [ "$NO_DINO" = "1" ] && eval_id="zsEVAL_JEPAVTS_nodino_${STUDENT}${eftag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
   [ "$DINO_DIRECT" = "1" ] && eval_id="zsEVAL_JEPAVTS_dinodirect_${STUDENT}${eftag}_${src}2${tgt}_${SEQ_LEN}_${pred}_s${seed}"
   # Eval done-marker: skip an eval that already completed, so re-running the
