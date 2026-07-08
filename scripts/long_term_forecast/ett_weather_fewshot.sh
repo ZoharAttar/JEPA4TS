@@ -42,6 +42,7 @@ DATASETS="${DATASETS:-ETTh1 ETTh2 ETTm1 ETTm2 weather}"
 # Which variants to run: jepa_single jepa_dual timemixer
 VARIANTS="${VARIANTS:-jepa_single jepa_dual timemixer}"
 
+STUDENT="${STUDENT:-TimeMixer}"      # JEPAVTS student backbone: TimeMixer | iTransformer
 RENDER="${RENDER:-RP}"               # JEPAVTS rendering (must be precomputed)
 JEPA_WEIGHT="${JEPA_WEIGHT:-1}"
 JEPA_SCALE="${JEPA_SCALE:-coarse}"
@@ -51,49 +52,76 @@ DS_WINDOW="${DS_WINDOW:-2}"
 LOG_DIR="${LOG_DIR:-logs/few_shot}"
 mkdir -p "$LOG_DIR"
 
-# Per-dataset config (== JEPAVTS_TimeMixer_all_datasets.sh).
-# Field order:
-#   data|root_path|data_path|enc_in|e_layers|d_model|d_ff|batch|ds_layers|lr|epochs|patience|dropout|seq_len|horizons
+# Per-dataset config, student-aware:
+#   TimeMixer    == JEPAVTS_TimeMixer_all_datasets.sh
+#   iTransformer == JEPAVTS_iTransformer_all_datasets.sh (forecasting)
+# Unified field order (ds_layers used by TimeMixer, factor used by iTransformer):
+#   data|root_path|data_path|enc_in|e_layers|d_model|d_ff|batch|ds_layers|factor|lr|epochs|patience|dropout|seq_len|horizons
 get_cfg() {
-  case "$1" in
-    ETTh1)   echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|16|32|128|3|0.01|10|3|0.6|96|96 192 336 720" ;;
-    ETTh2)   echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|16|32|128|3|0.01|10|3|0.6|96|96 192 336 720" ;;
-    ETTm1)   echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|16|32|128|3|0.01|10|3|0.1|96|96 192 336 720" ;;
-    ETTm2)   echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|32|64|128|3|0.01|10|3|0.1|96|96 192 336 720" ;;
-    weather) echo "custom|./dataset/weather/|weather.csv|21|2|16|32|128|3|0.01|20|10|0.1|96|96 192 336 720" ;;
-    *) echo "UNKNOWN dataset: $1" >&2; return 1 ;;
+  case "$STUDENT" in
+    TimeMixer)
+      case "$1" in
+        ETTh1)   echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|16|32|128|3|1|0.01|10|3|0.6|96|96 192 336 720" ;;
+        ETTh2)   echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|16|32|128|3|1|0.01|10|3|0.6|96|96 192 336 720" ;;
+        ETTm1)   echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|16|32|128|3|1|0.01|10|3|0.1|96|96 192 336 720" ;;
+        ETTm2)   echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|32|64|128|3|1|0.01|10|3|0.1|96|96 192 336 720" ;;
+        weather) echo "custom|./dataset/weather/|weather.csv|21|2|16|32|128|3|1|0.01|20|10|0.1|96|96 192 336 720" ;;
+        *) echo "UNKNOWN dataset: $1" >&2; return 1 ;;
+      esac ;;
+    iTransformer)
+      case "$1" in
+        ETTh1)   echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|128|128|32|0|3|0.0001|10|3|0.1|96|96 192 336 720" ;;
+        ETTh2)   echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|128|128|32|0|3|0.0001|10|3|0.1|96|96 192 336 720" ;;
+        ETTm1)   echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|128|128|32|0|3|0.0001|10|3|0.1|96|96 192 336 720" ;;
+        ETTm2)   echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|128|128|32|0|3|0.0001|10|3|0.1|96|96 192 336 720" ;;
+        weather) echo "custom|./dataset/weather/|weather.csv|21|3|512|512|32|0|3|0.0001|10|3|0.1|96|96 192 336 720" ;;
+        *) echo "UNKNOWN dataset: $1" >&2; return 1 ;;
+      esac ;;
+    *) echo "UNKNOWN student: $STUDENT (use TimeMixer|iTransformer)" >&2; return 1 ;;
   esac
 }
 
-# Model-family flags per variant. $1=variant $2=ds_layers
+# Model-family flags per variant. $1=variant $2=ds_layers $3=factor
 model_flags() {
-  local variant=$1 ds_layers=$2
-  local tm="--down_sampling_layers $ds_layers --down_sampling_method avg --down_sampling_window $DS_WINDOW"
+  local variant=$1 ds_layers=$2 factor=$3
+  # student-specific backbone flags: TimeMixer needs multi-scale downsampling;
+  # iTransformer needs its attention factor.
+  local sflags=""
+  if [ "$STUDENT" = "TimeMixer" ]; then
+    sflags="--down_sampling_layers $ds_layers --down_sampling_method avg --down_sampling_window $DS_WINDOW"
+  elif [ "$STUDENT" = "iTransformer" ]; then
+    sflags="--factor $factor"
+  fi
+  local jflags="--per_var_teacher --rendering_methods $RENDER --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS"
+  [ "$STUDENT" = "TimeMixer" ] && jflags="$jflags --timemixer_jepa_scale $JEPA_SCALE"
   case "$variant" in
     jepa_single)
-      echo "--model JEPAVTS --student_model TimeMixer $tm --timemixer_jepa_scale $JEPA_SCALE --per_var_teacher --rendering_methods $RENDER --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS" ;;
+      echo "--model JEPAVTS --student_model $STUDENT $sflags $jflags" ;;
     jepa_dual)
-      echo "--model JEPAVTS --student_model TimeMixer $tm --timemixer_jepa_scale $JEPA_SCALE --per_var_teacher --rendering_methods $RENDER --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS --use_dual_encoder --fusion_type mlp" ;;
-    timemixer)
-      echo "--model TimeMixer $tm" ;;
+      echo "--model JEPAVTS --student_model $STUDENT $sflags $jflags --use_dual_encoder --fusion_type mlp" ;;
+    timemixer|baseline)
+      echo "--model $STUDENT $sflags" ;;
     *) echo "UNKNOWN variant: $variant" >&2; return 1 ;;
   esac
 }
 
 model_id() {
   local variant=$1 name=$2 pred=$3 seed=$4 seq=$5
+  # student tag (non-default only) so TimeMixer ids stay backward-compatible while
+  # iTransformer gets its own .done markers / result rows (no collision).
+  local stag=""; [ "$STUDENT" != "TimeMixer" ] && stag="${STUDENT}_"
   case "$variant" in
-    jepa_single) echo "fs${PERCENT}_${name}_${RENDER}_${seq}_${pred}_single_s${seed}" ;;
-    jepa_dual)   echo "fs${PERCENT}_${name}_${RENDER}_${seq}_${pred}_dual_s${seed}" ;;
-    timemixer)   echo "fs${PERCENT}_TimeMixer_${name}_${seq}_${pred}_s${seed}" ;;
+    jepa_single) echo "fs${PERCENT}_${stag}${name}_${RENDER}_${seq}_${pred}_single_s${seed}" ;;
+    jepa_dual)   echo "fs${PERCENT}_${stag}${name}_${RENDER}_${seq}_${pred}_dual_s${seed}" ;;
+    timemixer|baseline)   echo "fs${PERCENT}_${STUDENT}_${name}_${seq}_${pred}_s${seed}" ;;
   esac
 }
 
 # One job: train on PERCENT% then test (run.py is_training=1 trains + tests).
 run_one() {
   local name=$1 pred=$2 variant=$3 seed=$4 gpu=$5
-  local data root_path data_path enc_in e_layers d_model d_ff batch ds_layers lr epochs patience dropout seq horizons
-  IFS='|' read -r data root_path data_path enc_in e_layers d_model d_ff batch ds_layers lr epochs patience dropout seq horizons <<< "$(get_cfg "$name")" || return 1
+  local data root_path data_path enc_in e_layers d_model d_ff batch ds_layers factor lr epochs patience dropout seq horizons
+  IFS='|' read -r data root_path data_path enc_in e_layers d_model d_ff batch ds_layers factor lr epochs patience dropout seq horizons <<< "$(get_cfg "$name")" || return 1
 
   local mid; mid="$(model_id "$variant" "$name" "$pred" "$seed" "$seq")"
   local logf="$LOG_DIR/${mid}.log"
@@ -129,7 +157,7 @@ run_one() {
     --patience "$patience" \
     --dropout "$dropout" \
     --des Exp --itr 1 \
-    $(model_flags "$variant" "$ds_layers") \
+    $(model_flags "$variant" "$ds_layers" "$factor") \
     > "$logf" 2>&1
   if [ $? -eq 0 ]; then
     touch "$donef"; echo "[gpu $gpu] DONE:  $mid"
