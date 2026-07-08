@@ -39,6 +39,9 @@ if __name__ == '__main__':
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
     parser.add_argument('--label_len', type=int, default=48, help='start token length')
     parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
+    parser.add_argument('--percent', type=int, default=100,
+                        help='few-shot: percent of the TRAIN split to use (val/test unchanged); '
+                             '100 = full data, 10 = few-shot 10%%')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--transfer_checkpoint', type=str, default='',
