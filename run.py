@@ -295,6 +295,8 @@ if __name__ == '__main__':
                 args.embed,
                 args.distil,
                 args.des, ii)
+            if args.model == 'JEPAVTS':
+                setting = setting + '_' + args.student_model
 
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
@@ -328,6 +330,8 @@ if __name__ == '__main__':
             args.embed,
             args.distil,
             args.des, ii)
+        if args.model == 'JEPAVTS':
+            setting = setting + '_' + args.student_model
 
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
         exp.test(setting, test=1)
