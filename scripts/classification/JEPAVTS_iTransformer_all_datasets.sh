@@ -154,11 +154,17 @@ worker() {
 
 mkdir -p "$LOG_DIR"
 
+# Which encoder settings to run: single | dual | both (default). Override via env:
+#   ENC=single DATASETS="FaceDetection" bash scripts/classification/JEPAVTS_iTransformer_all_datasets.sh
+ENC="${ENC:-both}"
+case "$ENC" in single|dual|both) ;; *) echo "ENC must be single|dual|both (got '$ENC')" >&2; exit 1 ;; esac
+
 # Build the full job list (each entry: name:enc).
 job_list=""
 for name in $DATASETS; do
   get_cfg "$name" >/dev/null || exit 1
-  job_list="$job_list ${name}:single ${name}:dual"
+  [ "$ENC" = "single" ] || [ "$ENC" = "both" ] && job_list="$job_list ${name}:single"
+  [ "$ENC" = "dual" ]   || [ "$ENC" = "both" ] && job_list="$job_list ${name}:dual"
 done
 
 gpu_arr=($GPUS)
