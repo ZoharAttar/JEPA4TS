@@ -65,6 +65,12 @@ class Dataset_ETT_hour(Dataset):
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
 
+        # Few-shot: restrict the TRAIN split to the first `percent`% of its range
+        # (val/test unchanged). percent=100 (default) => full data.
+        percent = getattr(self.args, 'percent', 100)
+        if self.set_type == 0 and percent < 100:
+            border2 = border1 + int((border2 - border1) * percent / 100)
+
         if self.features == 'M' or self.features == 'MS':
             cols_data = df_raw.columns[1:]
             df_data = df_raw[cols_data]
@@ -164,6 +170,12 @@ class Dataset_ETT_minute(Dataset):
         border2s = [12 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 4 * 30 * 24 * 4, 12 * 30 * 24 * 4 + 8 * 30 * 24 * 4]
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
+
+        # Few-shot: restrict the TRAIN split to the first `percent`% of its range
+        # (val/test unchanged). percent=100 (default) => full data.
+        percent = getattr(self.args, 'percent', 100)
+        if self.set_type == 0 and percent < 100:
+            border2 = border1 + int((border2 - border1) * percent / 100)
 
         if self.features == 'M' or self.features == 'MS':
             cols_data = df_raw.columns[1:]
@@ -276,6 +288,12 @@ class Dataset_Custom(Dataset):
         border2s = [num_train, num_train + num_vali, len(df_raw)]
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
+
+        # Few-shot: restrict the TRAIN split to the first `percent`% of its range
+        # (val/test unchanged). percent=100 (default) => full data.
+        percent = getattr(self.args, 'percent', 100)
+        if self.set_type == 0 and percent < 100:
+            border2 = border1 + int((border2 - border1) * percent / 100)
 
         if self.features == 'M' or self.features == 'MS':
             cols_data = df_raw.columns[1:]
