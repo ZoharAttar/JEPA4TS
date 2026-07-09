@@ -332,12 +332,15 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
         
+        noise_ctx = self._make_noise_ctx(test_data)
+
         self.model.eval()
         print("🧪 Running test...")
         
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
                 batch_x = batch_x.float().to(self.device)
+                batch_x = self._apply_noise(batch_x, noise_ctx)
                 batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
