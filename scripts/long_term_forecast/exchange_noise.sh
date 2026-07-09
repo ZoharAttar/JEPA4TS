@@ -39,7 +39,7 @@ set -u
 GPU="${GPU:-0}"
 NOISE_LEVELS="${NOISE_LEVELS:-0 5 10 20}"
 PRED_LENS="${PRED_LENS:-96 192 336 720}"
-VARIANTS="${VARIANTS:-baseline jepa_single jepa_dual}"
+VARIANTS="${VARIANTS:-baseline jepa_single jepa_dual nodino}"
 RENDER="${RENDER:-RP}"
 SEED="${SEED:-2021}"
 LOG_DIR="${LOG_DIR:-logs/exchange_noise}"
@@ -87,6 +87,12 @@ jepa_flags() { # JEPAVTS + TimeMixer student
     --timemixer_jepa_scale $JEPA_SCALE --per_var_teacher --rendering_methods $RENDER \
     --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS"
 }
+nodino_flags() { # NO-DINO ablation: dual student encoders, task loss only.
+                 # No teacher / no JEPA / no vision -> needs NO precomputed embeddings.
+  echo "--model JEPAVTS --student_model TimeMixer --no_dino --fusion_type mlp \
+    --down_sampling_layers $DS_LAYERS --down_sampling_method avg --down_sampling_window $DS_WINDOW \
+    --timemixer_jepa_scale $JEPA_SCALE"
+}
 
 # Exact clean-checkpoint setting prefix per variant (matches run.py's builder).
 # The trailing student suffix (_TimeMixer) is matched by a glob in find_ckpt,
@@ -99,6 +105,7 @@ setting_prefix() {
     baseline)    echo "long_term_forecast_exchange_rate_${SEQ}_${pred}_TimeMixer${tail}" ;;
     jepa_single) echo "long_term_forecast_exchange_rate_${RENDER}_${SEQ}_${pred}_single_JEPAVTS${tail}" ;;
     jepa_dual)   echo "long_term_forecast_exchange_rate_${RENDER}_${SEQ}_${pred}_dual_JEPAVTS${tail}" ;;
+    nodino)      echo "long_term_forecast_exchange_rate_nodino_${SEQ}_${pred}_JEPAVTS${tail}" ;;
     *) echo ""; return 1 ;;
   esac
 }
@@ -117,6 +124,7 @@ variant_extra() {   # model + architecture flags for a variant
     baseline)    echo "--model TimeMixer $(tm_flags)" ;;
     jepa_single) echo "$(jepa_flags)" ;;
     jepa_dual)   echo "$(jepa_flags) --use_dual_encoder --fusion_type mlp" ;;
+    nodino)      echo "$(nodino_flags)" ;;
   esac
 }
 
@@ -126,6 +134,7 @@ clean_model_id() {  # model_id used when TRAINING the clean checkpoint
     baseline)    echo "exchange_rate_${SEQ}_${pred}" ;;
     jepa_single) echo "exchange_rate_${RENDER}_${SEQ}_${pred}_single" ;;
     jepa_dual)   echo "exchange_rate_${RENDER}_${SEQ}_${pred}_dual" ;;
+    nodino)      echo "exchange_rate_nodino_${SEQ}_${pred}" ;;
   esac
 }
 
