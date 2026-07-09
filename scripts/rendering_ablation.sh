@@ -1,6 +1,7 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════
-# TABLE 6 — Rendering / plotting-strategy ablation (iTransformer backbone).
+# TABLE 6 — Rendering / plotting-strategy ablation.
+# Backbone selectable via STUDENT (iTransformer | TimeMixer); default iTransformer.
 #
 # Variants (columns of the "Plotting Method" table):
 #   baseline   No Plotting  -> standalone iTransformer, NO visual distillation
@@ -22,6 +23,7 @@
 #   VARIANTS="baseline RP" TASK=forecast bash scripts/ablation/rendering_ablation.sh
 #
 # Env overrides:
+#   STUDENT="iTransformer"           backbone: iTransformer | TimeMixer
 #   GPUS="0 1 2 3 4 5 6 7"            gpus to spread jobs across (round-robin)
 #   JOBS_PER_GPU=1                    concurrent jobs per gpu (raise for tiny forecast jobs)
 #   TASK="both"                       forecast | classify | both
@@ -55,9 +57,14 @@ PRED_LENS="${PRED_LENS:-96 192 336 720}"
 LOG_DIR="${LOG_DIR:-logs/rendering_ablation}"
 mkdir -p "$LOG_DIR"
 
-STUDENT=iTransformer
+STUDENT="${STUDENT:-iTransformer}"   # backbone: iTransformer | TimeMixer
 JEPA_WEIGHT=1
 JEPA_LOSS=mse
+
+# Student tag for log/marker/model_id names. Empty for iTransformer so existing
+# iTransformer runs keep their names (backward compatible); "<Student>_" otherwise
+# so TimeMixer and iTransformer never collide.
+[ "$STUDENT" = "iTransformer" ] && sfx="" || sfx="${STUDENT}_"
 
 enc_flags=""; enc_tag="single"
 [ "$ENC" = "dual" ] && { enc_flags="--use_dual_encoder --fusion_type mlp"; enc_tag="dual"; }
@@ -70,51 +77,69 @@ jepa_render_flags() {
   esac
 }
 
-# ── Forecast config (Exchange, iTransformer — matches
-#    scripts/long_term_forecast/JEPAVTS_iTransformer_all_datasets.sh) ────────
+# ── Forecast config (Exchange) — per-backbone, matching the respective
+#    JEPAVTS_<Student>_all_datasets.sh exchange row. STUDENT_FLAGS go to BOTH the
+#    plain baseline and the JEPAVTS runs; JEPA_STUDENT_FLAGS add JEPAVTS-only knobs.
 F_ROOT=./dataset/exchange_rate/ ; F_DPATH=exchange_rate.csv ; F_DATA=custom
-F_ENC_IN=8 ; F_ELAYERS=2 ; F_DMODEL=128 ; F_DFF=128 ; F_FACTOR=3
-F_BATCH=32 ; F_LR=0.0001 ; F_EPOCHS=10 ; F_PAT=3 ; F_DROP=0.1 ; F_SEQ=96
+F_ENC_IN=8 ; F_EPOCHS=10 ; F_PAT=3 ; F_DROP=0.1 ; F_SEQ=96
+case "$STUDENT" in
+  iTransformer)
+    F_ELAYERS=2 ; F_DMODEL=128 ; F_DFF=128 ; F_BATCH=32 ; F_LR=0.0001
+    FC_STUDENT_FLAGS="--factor 3"
+    FC_JEPA_STUDENT_FLAGS="--factor 3" ;;
+  TimeMixer)
+    F_ELAYERS=2 ; F_DMODEL=16 ; F_DFF=32 ; F_BATCH=32 ; F_LR=0.01
+    FC_STUDENT_FLAGS="--down_sampling_layers 3 --down_sampling_method avg --down_sampling_window 2"
+    FC_JEPA_STUDENT_FLAGS="$FC_STUDENT_FLAGS --timemixer_jepa_scale coarse" ;;
+  *) echo "Unsupported STUDENT: $STUDENT (use iTransformer | TimeMixer)" >&2; exit 1 ;;
+esac
 
 run_forecast() {
   local gpu=$1 variant=$2 pred=$3 mid
-  if [ "$variant" = "baseline" ]; then mid="exchange_rate_baseline_${F_SEQ}_${pred}"
-  else mid="exchange_rate_${variant}_${enc_tag}_${F_SEQ}_${pred}"; fi
-  local logf="$LOG_DIR/fc_${variant}_${enc_tag}_pl${pred}.log"
-  local donef="$LOG_DIR/fc_${variant}_${enc_tag}_pl${pred}.done"
+  if [ "$variant" = "baseline" ]; then mid="exchange_rate_${sfx}baseline_${F_SEQ}_${pred}"
+  else mid="exchange_rate_${sfx}${variant}_${enc_tag}_${F_SEQ}_${pred}"; fi
+  local logf="$LOG_DIR/fc_${sfx}${variant}_${enc_tag}_pl${pred}.log"
+  local donef="$LOG_DIR/fc_${sfx}${variant}_${enc_tag}_pl${pred}.done"
   [ -f "$donef" ] && { echo "[gpu $gpu][fc] SKIP $mid"; return 0; }
 
   local common="--task_name long_term_forecast --is_training 1 \
     --root_path $F_ROOT --data_path $F_DPATH --data $F_DATA \
     --features M --seq_len $F_SEQ --label_len 0 --pred_len $pred \
-    --e_layers $F_ELAYERS --enc_in $F_ENC_IN --c_out $F_ENC_IN --factor $F_FACTOR \
+    --e_layers $F_ELAYERS --enc_in $F_ENC_IN --c_out $F_ENC_IN \
     --des Exp --itr 1 --d_model $F_DMODEL --d_ff $F_DFF \
     --learning_rate $F_LR --train_epochs $F_EPOCHS --patience $F_PAT \
     --batch_size $F_BATCH --dropout $F_DROP --model_id $mid"
 
   echo "[gpu $gpu][fc] START $mid"
   if [ "$variant" = "baseline" ]; then
-    CUDA_VISIBLE_DEVICES=$gpu python -u run.py $common --model iTransformer > "$logf" 2>&1
+    CUDA_VISIBLE_DEVICES=$gpu python -u run.py $common --model $STUDENT $FC_STUDENT_FLAGS > "$logf" 2>&1
   else
     CUDA_VISIBLE_DEVICES=$gpu python -u run.py $common \
       --model JEPAVTS --student_model $STUDENT --per_var_teacher \
       $(jepa_render_flags "$variant") --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS \
-      $enc_flags > "$logf" 2>&1
+      $FC_JEPA_STUDENT_FLAGS $enc_flags > "$logf" 2>&1
   fi
   [ $? -eq 0 ] && { touch "$donef"; echo "[gpu $gpu][fc] DONE $mid"; } || echo "[gpu $gpu][fc] FAIL $mid -> $logf"
 }
 
-# ── Classify config (SelfRegulationSCP1, iTransformer — matches
-#    scripts/classification/iTransformer.sh / JEPAVTS_iTransformer_all_datasets.sh) ─
+# ── Classify config (SelfRegulationSCP1) — per-backbone. iTransformer matches
+#    scripts/classification/iTransformer.sh. NOTE: JEPAVTS+TimeMixer classification
+#    is not part of the validated path — use STUDENT=TimeMixer for forecast; for
+#    classify prefer STUDENT=iTransformer.
 C_ROOT=./dataset/SelfRegulationSCP1/ ; DATASET_CLS=SelfRegulationSCP1
 C_ELAYERS=3 ; C_DMODEL=128 ; C_DFF=256 ; C_TOPK=3
 C_BATCH=16 ; C_LR=0.001 ; C_EPOCHS=100 ; C_PAT=10
+case "$STUDENT" in
+  iTransformer) CLS_STUDENT_FLAGS="" ; CLS_JEPA_STUDENT_FLAGS="" ;;
+  TimeMixer)    CLS_STUDENT_FLAGS="--channel_independence 0 --down_sampling_layers 3 --down_sampling_method avg --down_sampling_window 2"
+                CLS_JEPA_STUDENT_FLAGS="$CLS_STUDENT_FLAGS --timemixer_jepa_scale coarse" ;;
+esac
 
 run_classify() {
   local gpu=$1 variant=$2 des
-  if [ "$variant" = "baseline" ]; then des="baseline"; else des="${variant}_${enc_tag}"; fi
-  local logf="$LOG_DIR/cls_${variant}_${enc_tag}.log"
-  local donef="$LOG_DIR/cls_${variant}_${enc_tag}.done"
+  if [ "$variant" = "baseline" ]; then des="${sfx}baseline"; else des="${sfx}${variant}_${enc_tag}"; fi
+  local logf="$LOG_DIR/cls_${sfx}${variant}_${enc_tag}.log"
+  local donef="$LOG_DIR/cls_${sfx}${variant}_${enc_tag}.done"
   [ -f "$donef" ] && { echo "[gpu $gpu][cls] SKIP $DATASET_CLS $des"; return 0; }
 
   # model_id MUST be the bare dataset name (UEA loader locates the .ts files);
@@ -127,12 +152,12 @@ run_classify() {
 
   echo "[gpu $gpu][cls] START $DATASET_CLS $des"
   if [ "$variant" = "baseline" ]; then
-    CUDA_VISIBLE_DEVICES=$gpu python -u run.py $common --model iTransformer > "$logf" 2>&1
+    CUDA_VISIBLE_DEVICES=$gpu python -u run.py $common --model $STUDENT $CLS_STUDENT_FLAGS > "$logf" 2>&1
   else
     CUDA_VISIBLE_DEVICES=$gpu python -u run.py $common \
       --model JEPAVTS --student_model $STUDENT --per_var_teacher \
       $(jepa_render_flags "$variant") --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS \
-      --jepa_hidden_dim 256 $enc_flags > "$logf" 2>&1
+      --jepa_hidden_dim 256 $CLS_JEPA_STUDENT_FLAGS $enc_flags > "$logf" 2>&1
   fi
   [ $? -eq 0 ] && { touch "$donef"; echo "[gpu $gpu][cls] DONE $des"; } || echo "[gpu $gpu][cls] FAIL $des -> $logf"
 }
@@ -175,7 +200,7 @@ fi
 gpu_arr=($GPUS)
 job_arr=($job_list)
 ngpu=${#gpu_arr[@]}
-echo "══════════ Dispatching ${#job_arr[@]} jobs across $ngpu gpu(s): $GPUS (${JOBS_PER_GPU}/gpu), enc=$enc_tag ══════════"
+echo "══════════ STUDENT=$STUDENT | Dispatching ${#job_arr[@]} jobs across $ngpu gpu(s): $GPUS (${JOBS_PER_GPU}/gpu), enc=$enc_tag ══════════"
 
 # Round-robin assign jobs to gpus, then launch one background worker per gpu.
 for idx in "${!gpu_arr[@]}"; do
@@ -225,7 +250,7 @@ if [ "$TASK" = "forecast" ] || [ "$TASK" = "both" ]; then
     row="$v"
     sum_mse=0; sum_mae=0; n=0
     for p in $PRED_LENS; do
-      read -r mse mae <<< "$(fc_metric "$LOG_DIR/fc_${v}_${enc_tag}_pl${p}.log" "$v")"
+      read -r mse mae <<< "$(fc_metric "$LOG_DIR/fc_${sfx}${v}_${enc_tag}_pl${p}.log" "$v")"
       row="$row | ${mse}/${mae}"
       if [ "$mse" != "NA" ]; then
         sum_mse=$(awk "BEGIN{print $sum_mse+$mse}")
@@ -249,7 +274,7 @@ if [ "$TASK" = "classify" ] || [ "$TASK" = "both" ]; then
   echo "### SelfRegulationSCP1 classification  (Accuracy %)"
   echo "Plotting Method | Accuracy"
   for v in $VARIANTS; do
-    f="$LOG_DIR/cls_${v}_${enc_tag}.log"
+    f="$LOG_DIR/cls_${sfx}${v}_${enc_tag}.log"
     acc="NA"
     if [ -f "$f" ]; then
       acc=$(grep -E "accuracy:" "$f" | tail -1 | sed -E 's/.*accuracy:[[:space:]]*([0-9.eE+-]+).*/\1/')
