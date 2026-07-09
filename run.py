@@ -49,6 +49,12 @@ if __name__ == '__main__':
                              'SOURCE dataset. When set together with --is_training 0, the model is '
                              'evaluated on the (target) --data without retraining, loading weights '
                              'from this path instead of the setting-derived checkpoint.')
+    parser.add_argument('--test_noise', type=float, default=0.0,
+                        help='Test-time input robustness: additive Gaussian noise injected into the '
+                             'test input window (x_enc) only. Value is a PERCENT: the noise std for '
+                             'each variable = (test_noise/100) * that variable\'s std over the test '
+                             'split. Ground-truth targets stay clean. 0 = no noise (default). '
+                             'Deterministic given --seed. Only affects --is_training 0 evaluation.')
 
     # inputation task
     parser.add_argument('--mask_rate', type=float, default=0.25, help='mask ratio')
