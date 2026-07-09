@@ -1,5 +1,6 @@
 import os
 import torch
+import numpy as np
 from models import (
     Autoformer, Transformer, TimesNet, Nonstationary_Transformer, DLinear, FEDformer,
     Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, 
@@ -73,6 +74,37 @@ class Exp_Basic(object):
             device = torch.device('cpu')
             print('Use CPU')
         return device
+
+    def _make_noise_ctx(self, test_data):
+        """Build a test-input-noise context, or None when --test_noise <= 0.
+
+        Robustness eval: additive Gaussian noise is added to the input window
+        (x_enc) only. For each variable the noise std is
+            (test_noise / 100) * std(variable over the test split).
+        Deterministic given --seed so a given noise level is reproducible.
+        Returns (noise_pct, std_vec[1,1,N], generator) or None.
+        """
+        noise_pct = float(getattr(self.args, 'test_noise', 0.0) or 0.0)
+        if noise_pct <= 0:
+            return None
+        arr = np.asarray(test_data.data_x, dtype=np.float32)  # [T, N] (normalized)
+        std = np.std(arr, axis=0)  # per-variable std over the test split
+        std_vec = torch.tensor(std, dtype=torch.float32, device=self.device).view(1, 1, -1)
+        seed = int(getattr(self.args, 'seed', 2021))
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(seed)
+        print(f"🌫️  Test-input noise ENABLED: std = {noise_pct:g}% of per-variable std "
+              f"(input window only, seed={seed})")
+        return noise_pct, std_vec, gen
+
+    def _apply_noise(self, batch_x, noise_ctx):
+        """Add the pre-built Gaussian noise to a test input batch (no-op if None)."""
+        if noise_ctx is None:
+            return batch_x
+        noise_pct, std_vec, gen = noise_ctx
+        noise = torch.randn(batch_x.shape, generator=gen,
+                            device=batch_x.device, dtype=batch_x.dtype)
+        return batch_x + (noise_pct / 100.0) * std_vec * noise
 
     def _get_data(self):
         pass
