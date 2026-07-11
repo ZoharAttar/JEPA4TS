@@ -92,24 +92,34 @@ class Model(nn.Module):
         dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, L, 1))
         return dec_out
 
-    def anomaly_detection(self, x_enc):
+    def anomaly_encode(self, x_enc):
         # Normalization from Non-stationary Transformer
         means = x_enc.mean(1, keepdim=True).detach()
         x_enc = x_enc - means
         stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        x_enc /= stdev
+        x_enc = x_enc / stdev
 
-        _, L, N = x_enc.shape
-
-        # Embedding
+        # Embedding (per-variable inverted tokens, same as forecast encode).
+        # Returns the encoder tokens so JEPAVTS can align each variable token
+        # with its teacher embedding.
         enc_out = self.enc_embedding(x_enc, None)
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
+        return enc_out, means, stdev  # enc_out: (batch, n_vars, d_model)
 
+    def anomaly_decode(self, enc_out, means, stdev):
+        # L is the reconstruction window length (== seq_len for anomaly detection);
+        # N (number of variables) is recovered from the normalization stats.
+        L = self.seq_len
+        N = means.shape[-1]
         dec_out = self.projection(enc_out).permute(0, 2, 1)[:, :, :N]
         # De-Normalization from Non-stationary Transformer
         dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, L, 1))
         dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, L, 1))
         return dec_out
+
+    def anomaly_detection(self, x_enc):
+        enc_out, means, stdev = self.anomaly_encode(x_enc)
+        return self.anomaly_decode(enc_out, means, stdev)
 
     def classification_encode(self, x_enc, x_mark_enc):
         # Embedding (logic identical to classification(); x_mark_enc unused, kept
