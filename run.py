@@ -7,6 +7,7 @@ from exp.exp_jepa_vts_long_term_forecasting import Exp_JEPA_VTS_Long_Term_Foreca
 from exp.exp_imputation import Exp_Imputation
 from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
 from exp.exp_anomaly_detection import Exp_Anomaly_Detection
+from exp.exp_jepa_vts_anomaly_detection import Exp_JEPA_VTS_Anomaly_Detection
 from exp.exp_classification import Exp_Classification
 from exp.exp_jepa_vts_classification import Exp_JEPA_VTS_Classification
 from utils.print_args import print_args
@@ -268,7 +269,10 @@ if __name__ == '__main__':
     elif args.task_name == 'imputation':
         Exp = Exp_Imputation
     elif args.task_name == 'anomaly_detection':
-        Exp = Exp_Anomaly_Detection
+        if args.model == 'JEPAVTS':
+            Exp = Exp_JEPA_VTS_Anomaly_Detection
+        else:
+            Exp = Exp_Anomaly_Detection
     elif args.task_name == 'classification':
         if args.model == 'JEPAVTS':
             Exp = Exp_JEPA_VTS_Classification
