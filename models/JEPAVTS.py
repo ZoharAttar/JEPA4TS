@@ -992,6 +992,42 @@ class Model(nn.Module):
             return forecast_output, jepa_encodings, predicted_teacher
         return forecast_output
 
+    def anomaly_forward(self, x_enc, return_all=False):
+        """
+        Single-encoder anomaly detection: reconstruct the input window and, during
+        training, align the student encoding to the teacher.
+        x_enc: [batch, win_size, n_vars]
+        Returns the reconstruction [batch, win_size, n_vars] (and, when return_all,
+        the student encoding and predicted teacher encoding for the JEPA loss).
+        """
+        enc_out, means, stdev = self.student.anomaly_encode(x_enc)
+        recon = self.student.anomaly_decode(enc_out, means, stdev)
+
+        if return_all:
+            predicted_teacher_encoding = self._predict_teacher(
+                self._to_jepa_encoding(enc_out))
+            return recon, enc_out, predicted_teacher_encoding
+
+        return recon
+
+    def anomaly_forward_dual_encoder(self, x_enc, return_all=False):
+        """
+        Dual-encoder anomaly detection: a reconstruction encoder and a JEPA encoder,
+        fused before decoding; only the JEPA branch is aligned to the teacher.
+        """
+        enc1, means1, stdev1 = self.student1.anomaly_encode(x_enc)
+        enc2, means2, stdev2 = self.student2.anomaly_encode(x_enc)
+
+        combined_encoding = self.encoder_fusion(enc1, enc2)
+        recon = self.student1.anomaly_decode(combined_encoding, means1, stdev1)
+
+        if return_all:
+            predicted_teacher_encoding = self._predict_teacher(
+                self._to_jepa_encoding(enc2))
+            return recon, predicted_teacher_encoding
+
+        return recon
+
     def _encode_cls(self, student, x_enc):
         """Encode a batch for classification.
 
@@ -1168,7 +1204,14 @@ class Model(nn.Module):
             else:
                 return self.classification_forward(
                     x_enc, padding_mask, return_all=self.training)
-        
+
+        # Anomaly detection task (reconstruction-based). x_mark/x_dec are unused.
+        if self.task_name == 'anomaly_detection':
+            if self.use_dual_encoder:
+                return self.anomaly_forward_dual_encoder(
+                    x_enc, return_all=self.training)
+            return self.anomaly_forward(x_enc, return_all=self.training)
+
         # Forecasting task
         if self.no_dino:
             return self.student_forward_no_dino(
