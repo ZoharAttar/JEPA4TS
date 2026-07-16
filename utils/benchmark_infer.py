@@ -20,7 +20,15 @@ Usage
 """
 import argparse
 import time
+import sys
+from pathlib import Path
+
 import torch
+
+project_root = str(Path(__file__).resolve().parents[1])
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from models import TimeMixer
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
