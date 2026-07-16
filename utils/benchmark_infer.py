@@ -47,6 +47,15 @@ def main():
     p.add_argument('--batch_size', type=int, default=1)
     p.add_argument('--warmup', type=int, default=20)
     p.add_argument('--iters', type=int, default=200)
+    # VibeTS (JEPAVTS) options: build the full VibeTS model and time its
+    # inference forward, to empirically confirm it equals the plain TimeMixer.
+    # Requires the RP per-var teacher cache to exist for --data/--root_path.
+    p.add_argument('--vibets', action='store_true',
+                   help='Benchmark VibeTS (JEPAVTS) inference instead of plain TimeMixer')
+    p.add_argument('--student_model', type=str, default='TimeMixer')
+    p.add_argument('--data', type=str, default='custom')
+    p.add_argument('--root_path', type=str, default='./dataset/exchange_rate')
+    p.add_argument('--rendering_methods', type=str, nargs='+', default=['RP'])
     args = p.parse_args()
 
     cfg = argparse.Namespace(
@@ -58,8 +67,38 @@ def main():
         channel_independence=1, down_sampling_layers=args.down_sampling_layers,
         down_sampling_window=args.down_sampling_window, down_sampling_method='avg')
 
-    model = TimeMixer.Model(cfg).float().to(DEVICE).eval()
-    n_params = sum(p.numel() for p in model.parameters())
+    if args.vibets:
+        # Extend cfg with JEPAVTS-specific fields, then build the full model.
+        cfg.model = 'JEPAVTS'
+        cfg.student_model = args.student_model
+        cfg.data = args.data
+        cfg.root_path = args.root_path
+        cfg.rendering_methods = args.rendering_methods
+        cfg.per_var_teacher = True
+        cfg.jepa_weight = 1.0
+        cfg.jepa_hidden_dim = 512
+        cfg.jepa_num_layers = 2
+        cfg.jepa_loss_type = 'mse'
+        cfg.use_dual_encoder = False
+        cfg.no_dino = False
+        cfg.dino_direct = False
+        cfg.fusion_type = 'mlp'
+        cfg.vit_model = 'vit_base_patch16_224'
+        cfg.learned_loss_weights = False
+        cfg.multi_rendering_alpha_mode = 'same'
+        cfg.per_method_alphas = None
+        cfg.multi_predictor = False
+        cfg.multi_encoder = False
+        cfg.timemixer_jepa_scale = 'coarse'
+        from models.JEPAVTS import Model as JEPAVTS
+        model = JEPAVTS(cfg).float().to(DEVICE).eval()
+        # Inference-active params = student only (predictor/teacher unused at test).
+        n_params = sum(p.numel() for p in model.student.parameters())
+        print("[VibeTS] eval mode: forward uses student.forecast_decode only "
+              "(no predictor/teacher/rendering)")
+    else:
+        model = TimeMixer.Model(cfg).float().to(DEVICE).eval()
+        n_params = sum(p.numel() for p in model.parameters())
 
     B, L, N = args.batch_size, args.seq_len, args.enc_in
     x = torch.randn(B, L, N, device=DEVICE)
