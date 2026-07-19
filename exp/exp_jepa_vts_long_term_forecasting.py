@@ -318,13 +318,41 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         
         return self.model
     
+    def _load_transfer_state_dict(self, state_dict):
+        """Load a source checkpoint tolerating shape-mismatched tensors.
+
+        Keeps only tensors whose shape matches the current (target) model; keys that
+        differ (e.g. the TimeMixer student's enc_in-sized RevIN affine when the target
+        has a different number of variables) are skipped and keep their init. Uses
+        strict=False so skipped keys are simply left as 'missing'.
+        """
+        model_sd = self.model.state_dict()
+        filtered, dropped = {}, []
+        for k, v in state_dict.items():
+            if k in model_sd and model_sd[k].shape == v.shape:
+                filtered[k] = v
+            else:
+                dropped.append(k)
+        self.model.load_state_dict(filtered, strict=False)
+        if dropped:
+            preview = ', '.join(dropped[:6]) + ('...' if len(dropped) > 6 else '')
+            print('[transfer] skipped {} shape-mismatched/unknown tensor(s): {}'.format(len(dropped), preview))
+
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
         if test:
             transfer_ckpt = getattr(self.args, 'transfer_checkpoint', '')
             ckpt_path = transfer_ckpt if transfer_ckpt else os.path.join('./checkpoints/' + setting, 'checkpoint.pth')
             print('📂 Loading model from {}...'.format(ckpt_path))
-            self.model.load_state_dict(torch.load(ckpt_path))
+            state_dict = torch.load(ckpt_path, map_location='cpu')
+            if transfer_ckpt:
+                # Cross-dataset transfer: target may have a different variable count.
+                # Drop checkpoint tensors whose shape mismatches the (target-enc_in)
+                # model — e.g. the TimeMixer student's RevIN normalize_layers affine
+                # of shape [enc_in]. See _load_transfer_state_dict for rationale.
+                self._load_transfer_state_dict(state_dict)
+            else:
+                self.model.load_state_dict(state_dict)
         
         preds = []
         trues = []
