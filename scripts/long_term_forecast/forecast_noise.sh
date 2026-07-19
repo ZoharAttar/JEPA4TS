@@ -1,44 +1,52 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════
-# Test-time INPUT-NOISE robustness on forecasting, multiple datasets.
+# Test-time INPUT-NOISE robustness on forecasting, multiple datasets, either
+# backbone (TimeMixer or iTransformer).
 #
-#   Baseline TimeMixer   vs   JEPAVTS + TimeMixer student   (SINGLE encoder)
+#   Baseline <STUDENT>   vs   JEPAVTS + <STUDENT> student   (SINGLE encoder)
 #
-# Same protocol as scripts/robustness/exchange_noise.sh, generalized to ETT +
-# Weather. Additive Gaussian noise is injected into the TEST input window
-# (x_enc) only: noise std per variable = (noise% / 100) * that variable's std
-# over the test split. Ground-truth targets stay clean. Deterministic given --seed.
+# Additive Gaussian noise is injected into the TEST input window (x_enc) only:
+#   noise std per variable = (noise% / 100) * that variable's std over the test
+#   split. Ground-truth targets stay clean. Deterministic given --seed.
 #
-# Per-dataset TimeMixer hyper-params are IDENTICAL to
-# scripts/long_term_forecast/JEPAVTS_TimeMixer_all_datasets.sh, so the CLEAN
-# JEPAVTS single-encoder checkpoints you already trained are reused as-is
-# (only the missing plain-TimeMixer baselines get trained).
+# Per-dataset hyper-params are IDENTICAL to the matching all-datasets script,
+# selected by STUDENT:
+#   TimeMixer    -> scripts/long_term_forecast/JEPAVTS_TimeMixer_all_datasets.sh
+#   iTransformer -> scripts/long_term_forecast/JEPAVTS_iTransformer_all_datasets.sh
+# so the CLEAN JEPAVTS single-encoder checkpoints you already trained are reused
+# as-is; only the missing plain-<STUDENT> baselines get trained.
 #
 # Two phases per dataset:
 #   1) Train (or reuse) the CLEAN checkpoints once.
 #   2) For every noise level, evaluate every horizon/variant on the noisy test
 #      input, loading the CLEAN checkpoint via --transfer_checkpoint (no retrain).
 #
-# Usage (defaults shown):
+# Usage:
+#   # iTransformer noise on exchange + weather (this request):
+#   STUDENT=iTransformer DATASETS="exchange_rate weather" GPU=0 \
+#     bash scripts/robustness/forecast_noise.sh
+#
+#   # TimeMixer (default) on ETT + weather:
 #   bash scripts/robustness/forecast_noise.sh
-#   GPU=1 DATASETS="ETTh1 weather" bash scripts/robustness/forecast_noise.sh
-#   NOISE_LEVELS="0 5 10 20" VARIANTS="baseline jepa_single" bash scripts/robustness/forecast_noise.sh
 #
 # Env overrides:
+#   STUDENT=TimeMixer|iTransformer     backbone for baseline AND jepa variants
 #   GPU=0                              gpu id
-#   DATASETS="ETTh1 ETTh2 ETTm1 ETTm2 weather"
+#   DATASETS="ETTh1 ETTh2 ETTm1 ETTm2 weather exchange_rate"
 #   NOISE_LEVELS="0 5 10 20"          percent noise sweep
 #   PRED_LENS="96 192 336 720"        horizons
-#   VARIANTS="baseline jepa_single"   (single encoder only, per request)
+#   VARIANTS="baseline jepa_single"   (single encoder only)
 #   RENDER=RP   SEED=2021
+#   LOG_DIR=logs/forecast_noise_<STUDENT>   (default; per-backbone to avoid clobber)
 #
 # PREREQUISITE for the JEPAVTS variant: per-variable DINO embeddings must exist
 # for each dataset (they do if you trained the JEPAVTS single-encoder runs):
-#   python utils/precompute_embeddings_pervar.py --dataset ETTh1 --method RP
+#   python utils/precompute_embeddings_pervar.py --dataset exchange_rate --method RP
 # (Only needed at TRAIN time; noisy-eval does not touch the teacher.)
 # ═══════════════════════════════════════════════════════════════════════════
 set -u
 
+STUDENT="${STUDENT:-TimeMixer}"      # TimeMixer | iTransformer
 GPU="${GPU:-0}"
 DATASETS="${DATASETS:-ETTh1 ETTh2 ETTm1 ETTm2 weather}"
 NOISE_LEVELS="${NOISE_LEVELS:-0 5 10 20}"
@@ -46,7 +54,7 @@ PRED_LENS="${PRED_LENS:-96 192 336 720}"
 VARIANTS="${VARIANTS:-baseline jepa_single}"
 RENDER="${RENDER:-RP}"
 SEED="${SEED:-2021}"
-LOG_DIR="${LOG_DIR:-logs/forecast_noise}"
+LOG_DIR="${LOG_DIR:-logs/forecast_noise_${STUDENT}}"
 CKPT_ROOT="./checkpoints"
 
 DS_WINDOW=2
@@ -56,16 +64,33 @@ JEPA_LOSS=mse
 
 mkdir -p "$LOG_DIR"
 
-# Per-dataset config (matches JEPAVTS_TimeMixer_all_datasets.sh).
-# Field order: data|root_path|data_path|enc_in|e_layers|d_model|d_ff|batch|ds_layers|lr|epochs|patience|dropout|seq_len
+# Per-(STUDENT, dataset) config. Field order:
+#   data|root_path|data_path|enc_in|e_layers|d_model|d_ff|factor|batch|ds_layers|lr|epochs|patience|dropout|seq_len
+# (factor -> fc in the checkpoint name; ds_layers used only by TimeMixer downsampling.)
 get_cfg() {
-  case "$1" in
-    ETTh1)   echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|16|32|128|3|0.01|10|3|0.6|96" ;;
-    ETTh2)   echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|16|32|128|3|0.01|10|3|0.6|96" ;;
-    ETTm1)   echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|16|32|128|3|0.01|10|3|0.1|96" ;;
-    ETTm2)   echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|32|64|128|3|0.01|10|3|0.1|96" ;;
-    weather) echo "custom|./dataset/weather/|weather.csv|21|2|16|32|128|3|0.01|20|10|0.1|96" ;;
-    *) echo "UNKNOWN dataset: $1" >&2; return 1 ;;
+  local ds=$1
+  case "$STUDENT" in
+    TimeMixer)
+      case "$ds" in
+        ETTh1)         echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|16|32|1|128|3|0.01|10|3|0.6|96" ;;
+        ETTh2)         echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|16|32|1|128|3|0.01|10|3|0.6|96" ;;
+        ETTm1)         echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|16|32|1|128|3|0.01|10|3|0.1|96" ;;
+        ETTm2)         echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|32|64|1|128|3|0.01|10|3|0.1|96" ;;
+        weather)       echo "custom|./dataset/weather/|weather.csv|21|2|16|32|1|128|3|0.01|20|10|0.1|96" ;;
+        exchange_rate) echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|2|16|32|1|32|3|0.01|10|3|0.1|96" ;;
+        *) echo "UNKNOWN dataset: $ds" >&2; return 1 ;;
+      esac ;;
+    iTransformer)
+      case "$ds" in
+        ETTh1)         echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
+        ETTh2)         echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
+        ETTm1)         echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
+        ETTm2)         echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
+        weather)       echo "custom|./dataset/weather/|weather.csv|21|3|512|512|3|32|0|0.0001|10|3|0.1|96" ;;
+        exchange_rate) echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
+        *) echo "UNKNOWN dataset: $ds" >&2; return 1 ;;
+      esac ;;
+    *) echo "UNKNOWN STUDENT: $STUDENT" >&2; return 1 ;;
   esac
 }
 
@@ -74,28 +99,31 @@ common_flags() {
   echo "--task_name long_term_forecast \
     --root_path $ROOT --data_path $DPATH --data $DATA \
     --features M --seq_len $SEQ --label_len 0 \
-    --e_layers $E_LAYERS --enc_in $ENC_IN --c_out $ENC_IN \
-    --des Exp --itr 1 --d_model $D_MODEL --d_ff $D_FF \
+    --e_layers $E_LAYERS --enc_in $ENC_IN --dec_in $ENC_IN --c_out $ENC_IN \
+    --des Exp --itr 1 --d_model $D_MODEL --d_ff $D_FF --factor $FACTOR \
     --learning_rate $LR --train_epochs $EPOCHS --patience $PATIENCE \
     --batch_size $BATCH --dropout $DROPOUT --seed $SEED"
 }
-tm_flags() {
-  echo "--down_sampling_layers $DS_LAYERS --down_sampling_method avg --down_sampling_window $DS_WINDOW"
+tm_arch_flags() {  # only for TimeMixer (needs multi-scale downsampling)
+  if [ "$STUDENT" = "TimeMixer" ]; then
+    echo "--down_sampling_layers $DS_LAYERS --down_sampling_method avg --down_sampling_window $DS_WINDOW"
+  fi
 }
 jepa_flags() {
-  echo "--model JEPAVTS --student_model TimeMixer \
-    --down_sampling_layers $DS_LAYERS --down_sampling_method avg --down_sampling_window $DS_WINDOW \
-    --timemixer_jepa_scale $JEPA_SCALE --per_var_teacher --rendering_methods $RENDER \
-    --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS"
+  local f="--model JEPAVTS --student_model $STUDENT --per_var_teacher --rendering_methods $RENDER \
+    --jepa_weight $JEPA_WEIGHT --jepa_loss_type $JEPA_LOSS $(tm_arch_flags)"
+  [ "$STUDENT" = "TimeMixer" ] && f="$f --timemixer_jepa_scale $JEPA_SCALE"
+  echo "$f"
 }
 
 # Clean-checkpoint setting prefix per variant (matches run.py's builder). The
-# trailing _TimeMixer student suffix (for JEPAVTS) is matched by a glob in find_ckpt.
+# trailing _<STUDENT> student suffix (for JEPAVTS) is matched by a glob in
+# find_ckpt; d_model/d_ff/fc in the tail disambiguate different backbones.
 setting_prefix() {
   local variant=$1 pred=$2
-  local tail="_${DATA}_ftM_sl${SEQ}_ll0_pl${pred}_dm${D_MODEL}_nh8_el${E_LAYERS}_dl1_df${D_FF}_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0"
+  local tail="_${DATA}_ftM_sl${SEQ}_ll0_pl${pred}_dm${D_MODEL}_nh8_el${E_LAYERS}_dl1_df${D_FF}_expand2_dc4_fc${FACTOR}_ebtimeF_dtTrue_Exp_0"
   case "$variant" in
-    baseline)    echo "long_term_forecast_${NAME}_${SEQ}_${pred}_TimeMixer${tail}" ;;
+    baseline)    echo "long_term_forecast_${NAME}_${SEQ}_${pred}_${STUDENT}${tail}" ;;
     jepa_single) echo "long_term_forecast_${NAME}_${RENDER}_${SEQ}_${pred}_single_JEPAVTS${tail}" ;;
     jepa_dual)   echo "long_term_forecast_${NAME}_${RENDER}_${SEQ}_${pred}_dual_JEPAVTS${tail}" ;;
     *) echo ""; return 1 ;;
@@ -112,7 +140,7 @@ find_ckpt() {
 
 variant_extra() {
   case "$1" in
-    baseline)    echo "--model TimeMixer $(tm_flags)" ;;
+    baseline)    echo "--model $STUDENT $(tm_arch_flags)" ;;
     jepa_single) echo "$(jepa_flags)" ;;
     jepa_dual)   echo "$(jepa_flags) --use_dual_encoder --fusion_type mlp" ;;
   esac
@@ -141,13 +169,15 @@ get_metric() {  # $1=logfile $2=variant -> "MSE MAE"
   echo "${mse:-NA} ${mae:-NA}"
 }
 
+echo "Backbone (STUDENT): $STUDENT   Datasets: $DATASETS   Logs: $LOG_DIR"
+
 # ═══════════════════════════════════════════════════════════════════════════
 for ds in $DATASETS; do
-  IFS='|' read -r DATA ROOT DPATH ENC_IN E_LAYERS D_MODEL D_FF BATCH DS_LAYERS LR EPOCHS PATIENCE DROPOUT SEQ <<< "$(get_cfg "$ds")" || exit 1
+  IFS='|' read -r DATA ROOT DPATH ENC_IN E_LAYERS D_MODEL D_FF FACTOR BATCH DS_LAYERS LR EPOCHS PATIENCE DROPOUT SEQ <<< "$(get_cfg "$ds")" || exit 1
   NAME="$ds"
 
   echo "══════════════════════════════════════════════════════════════════"
-  echo " DATASET: $ds  (data=$DATA enc_in=$ENC_IN dm=$D_MODEL df=$D_FF)"
+  echo " DATASET: $ds  ($STUDENT: data=$DATA enc_in=$ENC_IN dm=$D_MODEL df=$D_FF fc=$FACTOR)"
   echo "══════════════════════════════════════════════════════════════════"
 
   # ── Phase 1: train / reuse clean checkpoints ──────────────────────────
@@ -193,10 +223,10 @@ done
 # ── Summary tables (per dataset x variant x horizon x noise level) ────────
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
-echo " SUMMARY  (MSE / MAE)"
+echo " SUMMARY  ($STUDENT)  (MSE / MAE)"
 echo "══════════════════════════════════════════════════════════════════"
 for ds in $DATASETS; do
-  IFS='|' read -r DATA ROOT DPATH ENC_IN E_LAYERS D_MODEL D_FF BATCH DS_LAYERS LR EPOCHS PATIENCE DROPOUT SEQ <<< "$(get_cfg "$ds")"
+  IFS='|' read -r DATA ROOT DPATH ENC_IN E_LAYERS D_MODEL D_FF FACTOR BATCH DS_LAYERS LR EPOCHS PATIENCE DROPOUT SEQ <<< "$(get_cfg "$ds")"
   NAME="$ds"
   echo ""
   echo "########## $ds ##########"
