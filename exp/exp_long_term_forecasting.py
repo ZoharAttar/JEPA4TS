@@ -178,13 +178,44 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         return self.model
 
+    def _load_transfer_state_dict(self, state_dict):
+        """Load a source checkpoint tolerating shape-mismatched tensors.
+
+        Keeps only tensors whose shape matches the current (target) model; keys that
+        differ (e.g. enc_in-sized RevIN affine when the target has a different number
+        of variables) are skipped and keep their initialization. Uses strict=False so
+        the skipped keys are simply left as 'missing'.
+        """
+        model_sd = self.model.state_dict()
+        filtered, dropped = {}, []
+        for k, v in state_dict.items():
+            if k in model_sd and model_sd[k].shape == v.shape:
+                filtered[k] = v
+            else:
+                dropped.append(k)
+        self.model.load_state_dict(filtered, strict=False)
+        if dropped:
+            preview = ', '.join(dropped[:6]) + ('...' if len(dropped) > 6 else '')
+            print('[transfer] skipped {} shape-mismatched/unknown tensor(s): {}'.format(len(dropped), preview))
+
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
         if test:
             transfer_ckpt = getattr(self.args, 'transfer_checkpoint', '')
             ckpt_path = transfer_ckpt if transfer_ckpt else os.path.join('./checkpoints/' + setting, 'checkpoint.pth')
             print('loading model from {}'.format(ckpt_path))
-            self.model.load_state_dict(torch.load(ckpt_path))
+            state_dict = torch.load(ckpt_path, map_location='cpu')
+            if transfer_ckpt:
+                # Cross-dataset transfer: the target may have a different number of
+                # variables than the source. Drop checkpoint tensors whose shape does
+                # not match the (target-enc_in) model — e.g. TimeMixer's RevIN
+                # normalize_layers.*.affine_{weight,bias} of shape [enc_in]. Those are
+                # per-source-channel learned scale/shift that do not transfer across
+                # datasets; leaving them at their identity init keeps RevIN's instance
+                # (per-window) mean/std normalization intact.
+                self._load_transfer_state_dict(state_dict)
+            else:
+                self.model.load_state_dict(state_dict)
 
         preds = []
         trues = []
