@@ -65,30 +65,39 @@ JEPA_LOSS=mse
 mkdir -p "$LOG_DIR"
 
 # Per-(STUDENT, dataset) config. Field order:
-#   data|root_path|data_path|enc_in|e_layers|d_model|d_ff|factor|batch|ds_layers|lr|epochs|patience|dropout|seq_len
-# (factor -> fc in the checkpoint name; ds_layers used only by TimeMixer downsampling.)
+#   data|root_path|data_path|enc_in|e_layers|d_model|d_ff|n_heads|factor|batch|ds_layers|lr|epochs|patience|dropout|seq_len
+# (n_heads -> nh and factor -> fc in the checkpoint name; ds_layers used only by
+#  TimeMixer downsampling.)
 get_cfg() {
   local ds=$1
   case "$STUDENT" in
     TimeMixer)
       case "$ds" in
-        ETTh1)         echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|16|32|1|128|3|0.01|10|3|0.6|96" ;;
-        ETTh2)         echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|16|32|1|128|3|0.01|10|3|0.6|96" ;;
-        ETTm1)         echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|16|32|1|128|3|0.01|10|3|0.1|96" ;;
-        ETTm2)         echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|32|64|1|128|3|0.01|10|3|0.1|96" ;;
-        weather)       echo "custom|./dataset/weather/|weather.csv|21|2|16|32|1|128|3|0.01|20|10|0.1|96" ;;
-        exchange_rate) echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|2|16|32|1|32|3|0.01|10|3|0.1|96" ;;
+        ETTh1)         echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|16|32|8|1|128|3|0.01|10|3|0.6|96" ;;
+        ETTh2)         echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|16|32|8|1|128|3|0.01|10|3|0.6|96" ;;
+        ETTm1)         echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|16|32|8|1|128|3|0.01|10|3|0.1|96" ;;
+        ETTm2)         echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|32|64|8|1|128|3|0.01|10|3|0.1|96" ;;
+        weather)       echo "custom|./dataset/weather/|weather.csv|21|2|16|32|8|1|128|3|0.01|20|10|0.1|96" ;;
+        exchange_rate) echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|2|16|32|8|1|32|3|0.01|10|3|0.1|96" ;;
         *) echo "UNKNOWN dataset: $ds" >&2; return 1 ;;
       esac ;;
     iTransformer)
       case "$ds" in
-        ETTh1)         echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
-        ETTh2)         echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
-        ETTm1)         echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
-        ETTm2)         echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
-        weather)       echo "custom|./dataset/weather/|weather.csv|21|3|512|512|3|32|0|0.0001|10|3|0.1|96" ;;
-        exchange_rate) echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|2|128|128|3|32|0|0.0001|10|3|0.1|96" ;;
+        ETTh1)         echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|128|128|8|3|32|0|0.0001|10|3|0.1|96" ;;
+        ETTh2)         echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|128|128|8|3|32|0|0.0001|10|3|0.1|96" ;;
+        ETTm1)         echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|128|128|8|3|32|0|0.0001|10|3|0.1|96" ;;
+        ETTm2)         echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|128|128|8|3|32|0|0.0001|10|3|0.1|96" ;;
+        weather)       echo "custom|./dataset/weather/|weather.csv|21|3|512|512|8|3|32|0|0.0001|10|3|0.1|96" ;;
+        exchange_rate) echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|2|128|128|8|3|32|0|0.0001|10|3|0.1|96" ;;
         *) echo "UNKNOWN dataset: $ds" >&2; return 1 ;;
+      esac ;;
+    PatchTST)
+      # Matches the official PatchTST scripts (d_model/d_ff use run.py defaults
+      # 512/2048; Weather uses n_heads=4, epochs=3; Exchange uses n_heads=8).
+      case "$ds" in
+        weather)       echo "custom|./dataset/weather/|weather.csv|21|2|512|2048|4|3|32|0|0.0001|3|3|0.1|96" ;;
+        exchange_rate) echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|2|512|2048|8|3|32|0|0.0001|10|3|0.1|96" ;;
+        *) echo "UNKNOWN dataset for PatchTST: $ds (only weather/exchange_rate configured)" >&2; return 1 ;;
       esac ;;
     *) echo "UNKNOWN STUDENT: $STUDENT" >&2; return 1 ;;
   esac
@@ -100,7 +109,7 @@ common_flags() {
     --root_path $ROOT --data_path $DPATH --data $DATA \
     --features M --seq_len $SEQ --label_len 0 \
     --e_layers $E_LAYERS --enc_in $ENC_IN --dec_in $ENC_IN --c_out $ENC_IN \
-    --des Exp --itr 1 --d_model $D_MODEL --d_ff $D_FF --factor $FACTOR \
+    --des Exp --itr 1 --d_model $D_MODEL --d_ff $D_FF --n_heads $N_HEADS --factor $FACTOR \
     --learning_rate $LR --train_epochs $EPOCHS --patience $PATIENCE \
     --batch_size $BATCH --dropout $DROPOUT --seed $SEED"
 }
@@ -121,7 +130,7 @@ jepa_flags() {
 # find_ckpt; d_model/d_ff/fc in the tail disambiguate different backbones.
 setting_prefix() {
   local variant=$1 pred=$2
-  local tail="_${DATA}_ftM_sl${SEQ}_ll0_pl${pred}_dm${D_MODEL}_nh8_el${E_LAYERS}_dl1_df${D_FF}_expand2_dc4_fc${FACTOR}_ebtimeF_dtTrue_Exp_0"
+  local tail="_${DATA}_ftM_sl${SEQ}_ll0_pl${pred}_dm${D_MODEL}_nh${N_HEADS}_el${E_LAYERS}_dl1_df${D_FF}_expand2_dc4_fc${FACTOR}_ebtimeF_dtTrue_Exp_0"
   case "$variant" in
     baseline)    echo "long_term_forecast_${NAME}_${SEQ}_${pred}_${STUDENT}${tail}" ;;
     jepa_single) echo "long_term_forecast_${NAME}_${RENDER}_${SEQ}_${pred}_single_JEPAVTS${tail}" ;;
@@ -173,11 +182,11 @@ echo "Backbone (STUDENT): $STUDENT   Datasets: $DATASETS   Logs: $LOG_DIR"
 
 # ═══════════════════════════════════════════════════════════════════════════
 for ds in $DATASETS; do
-  IFS='|' read -r DATA ROOT DPATH ENC_IN E_LAYERS D_MODEL D_FF FACTOR BATCH DS_LAYERS LR EPOCHS PATIENCE DROPOUT SEQ <<< "$(get_cfg "$ds")" || exit 1
+  IFS='|' read -r DATA ROOT DPATH ENC_IN E_LAYERS D_MODEL D_FF N_HEADS FACTOR BATCH DS_LAYERS LR EPOCHS PATIENCE DROPOUT SEQ <<< "$(get_cfg "$ds")" || exit 1
   NAME="$ds"
 
   echo "══════════════════════════════════════════════════════════════════"
-  echo " DATASET: $ds  ($STUDENT: data=$DATA enc_in=$ENC_IN dm=$D_MODEL df=$D_FF fc=$FACTOR)"
+  echo " DATASET: $ds  ($STUDENT: data=$DATA enc_in=$ENC_IN dm=$D_MODEL df=$D_FF nh=$N_HEADS fc=$FACTOR)"
   echo "══════════════════════════════════════════════════════════════════"
 
   # ── Phase 1: train / reuse clean checkpoints ──────────────────────────
@@ -226,7 +235,7 @@ echo "════════════════════════�
 echo " SUMMARY  ($STUDENT)  (MSE / MAE)"
 echo "══════════════════════════════════════════════════════════════════"
 for ds in $DATASETS; do
-  IFS='|' read -r DATA ROOT DPATH ENC_IN E_LAYERS D_MODEL D_FF FACTOR BATCH DS_LAYERS LR EPOCHS PATIENCE DROPOUT SEQ <<< "$(get_cfg "$ds")"
+  IFS='|' read -r DATA ROOT DPATH ENC_IN E_LAYERS D_MODEL D_FF N_HEADS FACTOR BATCH DS_LAYERS LR EPOCHS PATIENCE DROPOUT SEQ <<< "$(get_cfg "$ds")"
   NAME="$ds"
   echo ""
   echo "########## $ds ##########"
