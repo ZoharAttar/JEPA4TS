@@ -11,8 +11,24 @@
 # IMPORTANT — architecture comes from the SOURCE:
 #   The transferred model is built from the SOURCE dataset's hyper-params
 #   (d_model, d_ff, e_layers, ds_layers, dropout, ...), since we load the source
-#   checkpoint. Only root_path/data_path/data switch to the TARGET at eval time.
-#   All ETT datasets share enc_in=7, so checkpoints load cleanly across them.
+#   checkpoint. Only root_path/data_path/data + enc_in switch to the TARGET at
+#   eval time. All ETT datasets share enc_in=7, so checkpoints load cleanly.
+#
+# CROSS-DOMAIN transfer (different variable count, e.g. exchange_rate:8 or
+# weather:21  ->  ETT:7):
+#   The model is built with the TARGET enc_in but SOURCE architecture, then the
+#   source checkpoint is loaded tolerantly (exp *_long_term_forecasting.py
+#   _load_transfer_state_dict): tensors whose shape matches load; shape-mismatched
+#   ones are skipped and keep their init.
+#     - iTransformer: NO enc_in-sized params (embedding Linear(seq_len,d_model),
+#       head Linear(d_model,pred_len)) -> everything transfers, nothing skipped.
+#     - TimeMixer (channel_independence=1, the default): the ONLY enc_in-sized
+#       params are the RevIN normalize_layers affine_{weight,bias} of shape
+#       [enc_in]. Those are per-source-channel learned scale/shift that do not
+#       transfer across datasets; they are skipped and left at identity, so RevIN
+#       still applies its per-window (instance) mean/std normalization. All other
+#       TimeMixer weights transfer. (Requires down_sampling_method=avg, as used
+#       here — 'conv' would add an enc_in-sized down-pool conv.)
 #
 # Per-dataset hyper-params are IDENTICAL to the matching all-datasets script,
 # selected automatically by the effective backbone (STUDENT for JEPAVTS):
@@ -116,23 +132,41 @@ get_cfg() {
   case "$BACKBONE" in
     TimeMixer)
       case "$ds" in
-        ETTh1|ETTh2) echo "7|2|16|32|128|0.01|10|3|0.6|1|3" ;;
-        ETTm1)       echo "7|2|16|32|128|0.01|10|3|0.1|1|3" ;;
-        ETTm2)       echo "7|2|32|64|128|0.01|10|3|0.1|1|3" ;;
+        ETTh1|ETTh2)   echo "7|2|16|32|128|0.01|10|3|0.6|1|3" ;;
+        ETTm1)         echo "7|2|16|32|128|0.01|10|3|0.1|1|3" ;;
+        ETTm2)         echo "7|2|32|64|128|0.01|10|3|0.1|1|3" ;;
+        exchange_rate) echo "8|2|16|32|32|0.01|10|3|0.1|1|3" ;;
+        weather)       echo "21|2|16|32|128|0.01|20|10|0.1|1|3" ;;
         *) echo "UNKNOWN dataset: $ds" >&2; return 1 ;;
       esac ;;
     iTransformer)
       case "$ds" in
         ETTh1|ETTh2|ETTm1|ETTm2) echo "7|2|128|128|32|0.0001|10|3|0.1|3|0" ;;
+        exchange_rate)           echo "8|2|128|128|32|0.0001|10|3|0.1|3|0" ;;
+        weather)                 echo "21|3|512|512|32|0.0001|10|3|0.1|3|0" ;;
         *) echo "UNKNOWN dataset: $ds" >&2; return 1 ;;
       esac ;;
     *) echo "No config for backbone=$BACKBONE dataset=$ds (add it to get_cfg)" >&2; return 1 ;;
   esac
 }
 
-# data,root_path,data_path resolver (data == dataset name for ETT loaders).
-ds_root() { echo "./dataset/ETT-small/"; }
+# data,root_path,data_path resolvers (ETT loaders use the dataset name as --data;
+# exchange_rate / weather use the generic 'custom' loader).
+ds_root() {
+  case "$1" in
+    ETTh1|ETTh2|ETTm1|ETTm2) echo "./dataset/ETT-small/" ;;
+    exchange_rate)           echo "./dataset/exchange_rate/" ;;
+    weather)                 echo "./dataset/weather/" ;;
+    *)                       echo "./dataset/$1/" ;;
+  esac
+}
 ds_file() { echo "$1.csv"; }
+ds_data() {
+  case "$1" in
+    ETTh1|ETTh2|ETTm1|ETTm2) echo "$1" ;;
+    *)                       echo "custom" ;;
+  esac
+}
 
 # Source model_id (appears inside the run.py "setting" string, so we can locate
 # the checkpoint folder by glob). For JEPAVTS this MATCHES the model_id used by
@@ -243,7 +277,7 @@ train_one() {
     --root_path "$(ds_root "$src")" \
     --data_path "$(ds_file "$src")" \
     --model_id "$tag" \
-    --data "$src" \
+    --data "$(ds_data "$src")" \
     --features M \
     --seq_len "$SEQ_LEN" \
     --label_len "$LABEL_LEN" \
@@ -277,6 +311,12 @@ eval_one() {
   local src="${pair%%:*}" tgt="${pair##*:}"
   local enc_in e_layers d_model d_ff batch lr epochs patience dropout factor ds_layers
   IFS='|' read -r enc_in e_layers d_model d_ff batch lr epochs patience dropout factor ds_layers <<< "$(get_cfg "$src")" || return 1
+  # enc_in follows the TARGET at eval time (data has the target's variable count).
+  # Architecture params (d_model/d_ff/e_layers/factor/ds_layers) stay from SOURCE,
+  # because we load the source checkpoint. For iTransformer this is safe (no
+  # enc_in-sized params); TimeMixer cannot cross variable counts (see header).
+  local tgt_enc_in; tgt_enc_in="$(get_cfg "$tgt" | awk -F'|' '{print $1}')"
+  [ -z "$tgt_enc_in" ] && tgt_enc_in="$enc_in"
   local tag; tag="$(src_tag "$src" "$pred" "$seed")"
   local ckpt; ckpt="$(find_ckpt "$tag" "$d_model" "$d_ff")"
   if [ -z "$ckpt" ]; then
@@ -312,15 +352,15 @@ eval_one() {
     --root_path "$(ds_root "$tgt")" \
     --data_path "$(ds_file "$tgt")" \
     --model_id "$eval_id" \
-    --data "$tgt" \
+    --data "$(ds_data "$tgt")" \
     --features M \
     --seq_len "$SEQ_LEN" \
     --label_len "$LABEL_LEN" \
     --pred_len "$pred" \
     --e_layers "$e_layers" \
-    --enc_in "$enc_in" \
-    --dec_in "$enc_in" \
-    --c_out "$enc_in" \
+    --enc_in "$tgt_enc_in" \
+    --dec_in "$tgt_enc_in" \
+    --c_out "$tgt_enc_in" \
     --d_model "$d_model" \
     --d_ff "$d_ff" \
     --factor "$factor" \
