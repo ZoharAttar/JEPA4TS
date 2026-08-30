@@ -9,11 +9,11 @@ that window's per-variable rendering.
 
 This script renders each TRAIN window per variable, embeds it with frozen DINOv2
 (CLS token, 768-d), and caches one ``[N, 768]`` array per window, keyed by the MD5
-hash of the window (exactly the key ``VisionTSTeacher`` uses at train time), into:
+hash of the window (exactly the key ``DINOTeacher`` uses at train time), into:
 
     {root_path}/dino_embeddings_{DATA}_{METHOD}_pervar
 
-so that at training time ``models/JEPAVTS.py :: VisionTSTeacher`` (which builds the
+so that at training time ``models/JEPAVTS.py :: DINOTeacher`` (which builds the
 same path from ``configs.data``) loads them with no recompute.
 
 IMPORTANT
