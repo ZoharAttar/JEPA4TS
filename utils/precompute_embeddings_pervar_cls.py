@@ -255,7 +255,7 @@ def main():
 
     parser.add_argument('--mirror_ett_path', action='store_true',
                         help='Also mirror cache under ./dataset/ETT-small/... '
-                             'to match the hardcoded path in JEPAVTS.VisionTSTeacher')
+                             'to match the hardcoded path in JEPAVTS.DINOTeacher')
     parser.add_argument('--zip', action='store_true', help='Zip cache dir when done')
     cli = parser.parse_args()
 
