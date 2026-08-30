@@ -8,7 +8,8 @@ import os
 import hashlib
 import numpy as np
 
-class VisionTSTeacher(nn.Module):
+
+class DINOTeacher(nn.Module):
     """
     Loads pre-computed DINO embeddings from cache.
     Works with ANY batch size since each sample is cached individually by hash.
@@ -37,15 +38,15 @@ class VisionTSTeacher(nn.Module):
         self.hidden_size = hidden_size
         
         if not os.path.exists(self.cache_dir):
-            raise ValueError(f"❌ Cache not found: {self.cache_dir}\n   Run precompute_embeddings.py first!")
+            raise ValueError(f"Cache not found: {self.cache_dir}\n   Run utils/precompute_embeddings_pervar*.py first!")
         
         n_cached = len([f for f in os.listdir(self.cache_dir) if f.endswith('.npy')])
         tag = f" [{rendering_method}]" if rendering_method else ""
         pv_tag = " [per_var]" if per_var else ""
-        print(f"✅ VisionTSTeacher{tag}{pv_tag}: Loading from cache")
-        print(f"✅ Cache dir: {self.cache_dir}")
-        print(f"✅ Cached embeddings: {n_cached}")
-        print(f"✅ Teacher hidden_size: {self.hidden_size}")
+        print(f"DINOTeacher{tag}{pv_tag}: Loading from cache")
+        print(f"Cache dir: {self.cache_dir}")
+        print(f"Cached embeddings: {n_cached}")
+        print(f"Teacher hidden_size: {self.hidden_size}")
     
     def _get_hash(self, ts_array):
         return hashlib.md5(ts_array.astype(np.float32).tobytes()).hexdigest()[:16]
@@ -69,42 +70,11 @@ class VisionTSTeacher(nn.Module):
             if os.path.exists(cache_path):
                 emb = np.load(cache_path)
             else:
-                raise FileNotFoundError(f"Embedding not found: {cache_path}\nRun precompute_embeddings.py!")
+                raise FileNotFoundError(f"Embedding not found: {cache_path}\nRun utils/precompute_embeddings_pervar*.py!")
             
             embeddings.append(torch.tensor(emb, dtype=torch.float32))
         
         return torch.stack(embeddings, dim=0).to(device)
-
-# class VisionTSTeacher(nn.Module):
-#     """
-#     Wrapper around VisionTS to use as frozen teacher encoder
-#     VisionTS handles time series to visual conversion internally
-#     """
-    
-#     def __init__(self, vit_model='facebook/dinov2-base'):
-#         super().__init__()
-#         #load ViT
-#         self.vis_fm = ViTModel.from_pretrained("facebook/dinov2-base")
-#         # self.vis_fm = timm.create_model(vit_model, pretrained=True)
-#         self.vis_fm.eval()
-#         for param in self.vis_fm.parameters():
-#             param.requires_grad = False
-
-#         # Get hidden dimension from ViT model
-#         # self.hidden_size = self.vis_fm.num_features
-#         self.hidden_size = self.vis_fm.config.hidden_size
-
-
-#         print(f"✅ ViT Teacher loaded: {vit_model}")
-#         print(f"✅ Teacher hidden_size: {self.hidden_size}")
-        
-
-#     def forward(self, x_enc):
-#         x_image = transform_RP_batch(x_enc)
-#         # teacher_encoding = self.vis_fm.forward_features(x_image)[:, 0, :]  # CLS token
-#         outputs = self.vis_fm(pixel_values=x_image)
-#         teacher_encoding = outputs.last_hidden_state[:, 0, :]  # CLS token
-#         return teacher_encoding
 
 
 class JEPAPredictor(nn.Module):
@@ -269,13 +239,13 @@ class EncodingFusion(nn.Module):
 
 class Model(nn.Module):
     """
-    JEPAVTS: Joint-Embedding Predictive Architecture for Vision-Time Series
-    Using VisionTS as the frozen teacher encoder
-    
+    JEPAVTS: Joint-Embedding Predictive Architecture for Vision-Time Series.
+
     Architecture:
-    - Teacher: VisionTS (frozen) - processes raw TS as visual
-    - Student: Time series model (trainable) - processes raw TS
-    - Predictor: Aligns student to teacher representations (trainable)
+    - Teacher: frozen DINOv2 on graphical renderings of the series (train only)
+    - Student: time-series backbone (trainable)
+    - Predictor: aligns student encodings to teacher embeddings (trainable)
+    Optional --masked_horizon adds a frozen MAE teacher on a VisionTS-style canvas.
     """
     
     def __init__(self, configs):
@@ -285,68 +255,52 @@ class Model(nn.Module):
 
         # Determine which architecture to use
         self.use_dual_encoder = getattr(configs, 'use_dual_encoder', False)
-        # NO-DINO ablation: two student encoders fused, task loss only. No teacher,
-        # no JEPA predictor, no vision — a capacity-matched control for the dual
-        # encoder. Needs no precomputed embeddings (teacher never built/called).
+        # NO-DINO ablation: dual student encoders, task loss only (no teacher/JEPA).
         self.no_dino = getattr(configs, 'no_dino', False)
-        # DINO-DIRECT ablation: single student encoder, but the frozen DINO
-        # embedding is injected directly into the fusion/forecast head instead of
-        # being a JEPA distillation target. DINO is a live input (train AND test).
+        # DINO-DIRECT ablation: feed the frozen DINO embedding into the head directly
+        # (a live input, not a JEPA target).
         self.dino_direct = getattr(configs, 'dino_direct', False)
-        # Classification: use the backbone's OWN classification head (mirrors how
-        # forecasting uses the backbone's forecast_decode) instead of the generic
-        # JEPAVTS head. Set per-backbone below; only backbones that expose a
-        # classification_decode consuming our encoding qualify (iTransformer).
+        # Classification: use the backbone's native classification head when available.
         self.use_native_cls_head = False
         
         print("\n" + "="*50)
         print("Initializing JEPAVTS Model")
         if self.no_dino:
-            print("Architecture: NO DINO (dual encoders, no teacher/JEPA) 🚫")
+            print("Architecture: NO DINO (dual encoders, no teacher/JEPA)")
         elif self.dino_direct:
-            print("Architecture: DINO DIRECT (single encoder + DINO into fusion head) 🎯")
+            print("Architecture: DINO DIRECT (single encoder + DINO into fusion head)")
         elif self.use_dual_encoder:
-            print("Architecture: DUAL ENCODER 🔀")
+            print("Architecture: DUAL ENCODER")
         else:
-            print("Architecture: SINGLE ENCODER →")
-        print("="*50)
-        
-        print("\n" + "="*50)
-        print("Initializing JEPAVTS Model")
+            print("Architecture: SINGLE ENCODER")
         print("="*50)
         
         # Get student model name
         student_model_name = getattr(configs, 'student_model', 'PatchTST')
         
-        # Teacher(s): VisionTS (frozen) - supports multi-rendering
-        print(f"\n📊 Loading teacher vision encoder...")
+        # Teacher(s): frozen DINO (cached embeddings) - supports multi-rendering
+        print(f"\nLoading teacher vision encoder...")
         self.data = getattr(configs, 'data')
         self.rendering_methods = getattr(configs, 'rendering_methods', None)
         self.per_var_teacher = getattr(configs, 'per_var_teacher', False)
         if self.no_dino:
-            # NO-DINO: never build/query the teacher. Force teacher-related state
-            # off so downstream code (encoding-type detection, forward) is safe.
+            # NO-DINO: never build/query the teacher.
             self.per_var_teacher = False
             self.rendering_methods = None
 
-        # Channel-independent TimesNet for classification: TimesNet mixes channels
-        # in its embedding (Conv1d: enc_in -> d_model), so it has no native
-        # per-variable representation. To align each variable with its own DINO
-        # embedding (per_var teacher), we fold the variables into the batch and
-        # encode each as a univariate series (built with enc_in=1), producing a
-        # per-variable encoding [B, N, d_model, T] — exactly like channel-
-        # independent PatchTST/TimeMixer. Only enabled for classification with a
-        # per-variable teacher; plain TimesNet stays channel-mixed.
+        # Channel-independent TimesNet for classification: fold variables into the
+        # batch and encode each as univariate (enc_in=1) so each aligns with its own
+        # DINO embedding. Only for classification + per-variable teacher.
         self.timesnet_ci = (
             student_model_name == 'TimesNet'
             and self.task_name == 'classification'
             and self.per_var_teacher
         )
         if self.timesnet_ci:
-            print("✅ Channel-independent TimesNet: per-variable encoding [B, N, d_model, T]")
+            print("Channel-independent TimesNet: per-variable encoding [B, N, d_model, T]")
 
         if self.per_var_teacher:
-            print("✅ Per-variable teacher mode: each variable gets its own DINO embedding")
+            print("Per-variable teacher mode: each variable gets its own DINO embedding")
         
         if self.no_dino:
             # NO-DINO ablation: no teacher at all.
@@ -354,13 +308,13 @@ class Model(nn.Module):
             self.num_renderings = 1
             self.teacher = None
             self.teacher_dim = 768  # placeholder, unused (no predictor)
-            print("📊 Skipping teacher (NO-DINO ablation)")
+            print("Skipping teacher (NO-DINO ablation)")
         elif self.rendering_methods and len(self.rendering_methods) > 0:
             # Multi-rendering mode: one teacher per rendering method
             self.multi_rendering = True
             self.num_renderings = len(self.rendering_methods)
             self.teachers = nn.ModuleList([
-                VisionTSTeacher(dataset_name=self.data, rendering_method=method,
+                DINOTeacher(dataset_name=self.data, rendering_method=method,
                                 per_var=self.per_var_teacher,root_path=getattr(configs,'root_path',None))
                 for method in self.rendering_methods
             ])
@@ -369,19 +323,19 @@ class Model(nn.Module):
             self.multi_rendering_alpha_mode = getattr(configs, 'multi_rendering_alpha_mode', 'same')
             self.per_method_alphas = getattr(configs, 'per_method_alphas', None)
             
-            print(f"✅ Multi-rendering mode: {self.rendering_methods}")
-            print(f"✅ Alpha mode: {self.multi_rendering_alpha_mode}")
+            print(f"Multi-rendering mode: {self.rendering_methods}")
+            print(f"Alpha mode: {self.multi_rendering_alpha_mode}")
             if self.multi_rendering_alpha_mode == 'per_method' and self.per_method_alphas:
-                print(f"✅ Per-method alphas: {self.per_method_alphas}")
+                print(f"Per-method alphas: {self.per_method_alphas}")
         else:
             # Single rendering mode (backward compatible)
             self.multi_rendering = False
             self.num_renderings = 1
-            self.teacher = VisionTSTeacher(dataset_name=self.data,
+            self.teacher = DINOTeacher(dataset_name=self.data,
                                            per_var=self.per_var_teacher,root_path=getattr(configs,'root_path',None))
             self.teacher_dim = self.teacher.hidden_size
         
-        print(f"✅ Teacher dimension: {self.teacher_dim}")
+        print(f"Teacher dimension: {self.teacher_dim}")
         
         # Student: Time Series Encoder (trainable)
         self.use_multi_encoder = (
@@ -391,7 +345,7 @@ class Model(nn.Module):
         
         if self.use_multi_encoder and self.use_dual_encoder:
             # K JEPA encoders (one per rendering) + 1 forecast encoder
-            print(f"\n🎓 Building {self.num_renderings} JEPA student models + 1 forecast encoder...")
+            print(f"\nBuilding {self.num_renderings} JEPA student models + 1 forecast encoder...")
             self.students_multi = nn.ModuleList([
                 self._build_student_model(student_model_name, configs)
                 for _ in self.rendering_methods
@@ -399,40 +353,40 @@ class Model(nn.Module):
             self.student_forecast = self._build_student_model(student_model_name, configs)
             self.student = self.students_multi[0]  # reference for shape detection
             for method in self.rendering_methods:
-                print(f"✅ JEPA Student [{method}]: {student_model_name}")
-            print(f"✅ Forecast Student: {student_model_name}")
+                print(f"JEPA Student [{method}]: {student_model_name}")
+            print(f"Forecast Student: {student_model_name}")
             num_fusion_inputs = self.num_renderings + 1
             self.encoder_fusion = EncodingFusion(
                 d_model=configs.d_model, num_inputs=num_fusion_inputs,
                 fusion_type=fusion_type)
-            print(f"✅ Fusion: {fusion_type} ({num_fusion_inputs} inputs)")
+            print(f"Fusion: {fusion_type} ({num_fusion_inputs} inputs)")
         elif self.use_multi_encoder:
             # K encoders (one per rendering), no separate forecast encoder
-            print(f"\n🎓 Building {self.num_renderings} student models (one per rendering)...")
+            print(f"\nBuilding {self.num_renderings} student models (one per rendering)...")
             self.students_multi = nn.ModuleList([
                 self._build_student_model(student_model_name, configs)
                 for _ in self.rendering_methods
             ])
             self.student = self.students_multi[0]  # reference for shape detection & decode
             for method in self.rendering_methods:
-                print(f"✅ Student [{method}]: {student_model_name}")
+                print(f"Student [{method}]: {student_model_name}")
         elif self.use_dual_encoder or self.no_dino:
             # 1 forecast encoder + 1 JEPA encoder, fused. (NO-DINO uses the same
             # two encoders + fusion for a capacity-matched control; the JEPA
             # branch is simply not trained against a teacher.)
-            print(f"\n🎓 Building dual encoder (forecast + JEPA)...")
+            print(f"\nBuilding dual encoder (forecast + JEPA)...")
             self.student = self._build_student_model(student_model_name, configs)
             self.student1 = self._build_student_model(student_model_name, configs)
             self.student2 = self._build_student_model(student_model_name, configs)
             self.encoder_fusion = EncodingFusion(
                 d_model=configs.d_model, num_inputs=2, fusion_type=fusion_type)
-            print(f"✅ Fusion: {fusion_type} (2 inputs)")
+            print(f"Fusion: {fusion_type} (2 inputs)")
         else:
             # Single encoder for everything
-            print(f"\n🎓 Building student model: {student_model_name}")
+            print(f"\nBuilding student model: {student_model_name}")
             self.student = self._build_student_model(student_model_name, configs)
         self.student_dim = configs.d_model
-        print(f"✅ Student dimension: {self.student_dim}")
+        print(f"Student dimension: {self.student_dim}")
 
         # DINO-DIRECT: project the frozen DINO embedding to d_model and fuse it
         # with the single student's encoding (DINO as a live second stream).
@@ -444,8 +398,8 @@ class Model(nn.Module):
             )
             self.dino_fusion_module = EncodingFusion(
                 d_model=configs.d_model, num_inputs=2, fusion_type=fusion_type)
-            print(f"✅ DINO-DIRECT projector: {self.teacher_dim} -> {configs.d_model}")
-            print(f"✅ DINO-DIRECT fusion: {fusion_type} (student ⊕ DINO)")
+            print(f"DINO-DIRECT projector: {self.teacher_dim} -> {configs.d_model}")
+            print(f"DINO-DIRECT fusion: {fusion_type} (student + DINO)")
 
         # Calculate encoding shape dynamically based on student model type
         student_model_name = getattr(configs, 'student_model', 'PatchTST')
@@ -461,18 +415,13 @@ class Model(nn.Module):
         elif student_model_name == 'iTransformer':
             # iTransformer.encode returns [B, nvars(+covariate tokens), d_model].
             # For JEPA we keep the nvars variable tokens and treat each as a
-            # patch_num=1 token → predictor input [B, nvars, d_model, 1].
+            # patch_num=1 token -> predictor input [B, nvars, d_model, 1].
             patch_num = 1
             self.encoding_type = 'itransformer'
             predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
         elif student_model_name == 'Crossformer':
-            # Crossformer natively keeps a per-variable axis. Its
-            # classification_encode returns [B, N, out_seg_num, d_model]; _encode_cls
-            # permutes it to the 4D convention [B, N, d_model, out_seg_num] so it
-            # reuses the per-var predictor / fusion / native-head machinery
-            # (exactly like PatchTST's 4D, with patch_num = out_seg_num). Each
-            # variable's [d_model, out_seg_num] token aligns with its own DINO
-            # per-variable teacher embedding.
+            # Crossformer keeps a per-variable axis; treat out_seg_num as patch_num
+            # for the 4D per-var machinery.
             patch_num = self.student.out_seg_num
             self.encoding_type = '4D'  # [B, nvars, d_model, out_seg_num]
             predictor_input_shape = (configs.enc_in, configs.d_model, patch_num)
@@ -489,14 +438,14 @@ class Model(nn.Module):
                 jepa_T = configs.seq_len
             self.timemixer_jepa_T = jepa_T
             if getattr(configs, 'channel_independence', 1):
-                # channel_independence=True: enc [B*N, T, d_model] → [B, N, d_model, T]
+                # channel_independence=True: enc [B*N, T, d_model] -> [B, N, d_model, T]
                 self.encoding_type = '4D_timemixer'
                 predictor_input_shape = (configs.enc_in, configs.d_model, jepa_T)
             else:
                 # channel_independence=False: enc [B, seq_len, d_model] (all vars mixed)
                 self.encoding_type = '3D'
                 predictor_input_shape = (jepa_T, configs.d_model, 1)
-            print(f"✅ TimeMixer JEPA scale: {self.timemixer_jepa_scale} "
+            print(f"TimeMixer JEPA scale: {self.timemixer_jepa_scale} "
                   f"(idx={self.timemixer_jepa_idx}, T={jepa_T}, "
                   f"flatten={configs.d_model * jepa_T})")
         elif student_model_name == 'TimesNet':
@@ -518,13 +467,13 @@ class Model(nn.Module):
             self.encoding_type = '1D'
             predictor_input_shape = None
 
-        print(f"✅ Encoding type: {self.encoding_type}")
+        print(f"Encoding type: {self.encoding_type}")
 
         # JEPA Predictor(s) (trainable)
         # multi_predictor and multi_encoder are independent:
-        #   --multi_predictor              → 1 student, k predictors (option 2)
-        #   --multi_encoder --multi_predictor → k students, k predictors (option 3)
-        #   --multi_encoder                → k students, 1 shared predictor (option 4)
+        #   --multi_predictor              -> 1 student, k predictors (option 2)
+        #   --multi_encoder --multi_predictor -> k students, k predictors (option 3)
+        #   --multi_encoder                -> k students, 1 shared predictor (option 4)
         self.use_multi_predictor = (
             getattr(configs, 'multi_predictor', False) and self.multi_rendering
         )
@@ -532,10 +481,10 @@ class Model(nn.Module):
         if self.no_dino or self.dino_direct:
             # NO-DINO / DINO-DIRECT ablations: no JEPA predictor at all.
             self.predictor = None
-            print("\n🔗 Skipping JEPA predictor (ablation: no JEPA distillation)")
+            print("\nSkipping JEPA predictor (ablation: no JEPA distillation)")
         elif self.use_multi_predictor:
             # One predictor per rendering method (separate z'_x per rendering)
-            print(f"\n🔗 Building {self.num_renderings} JEPA predictors (one per rendering)...")
+            print(f"\nBuilding {self.num_renderings} JEPA predictors (one per rendering)...")
             self.predictors = nn.ModuleList([
                 JEPAPredictor(
                     student_dim=configs.d_model,
@@ -547,10 +496,10 @@ class Model(nn.Module):
                 for _ in self.rendering_methods
             ])
             for method in self.rendering_methods:
-                print(f"✅ JEPA predictor [{method}]: {configs.d_model} -> {self.teacher_dim}")
+                print(f"JEPA predictor [{method}]: {configs.d_model} -> {self.teacher_dim}")
         else:
             # Single shared predictor (original behaviour)
-            print(f"\n🔗 Building JEPA predictor...")
+            print(f"\nBuilding JEPA predictor...")
             self.predictor = JEPAPredictor(
                     student_dim=configs.d_model,
                     teacher_dim=self.teacher_dim,
@@ -558,7 +507,37 @@ class Model(nn.Module):
                     input_shape=predictor_input_shape,
                     per_var=self.per_var_teacher
                 )
-            print(f"✅ JEPA predictor: {configs.d_model} -> {self.teacher_dim}")
+            print(f"JEPA predictor: {configs.d_model} -> {self.teacher_dim}")
+
+        # Masked-horizon teacher (frozen MAE on VisionTS [x | 0] canvas).
+        # Independent of DINO; extra predictor + loss, dropped at inference.
+        self.masked_horizon = getattr(configs, 'masked_horizon', False)
+        self.horizon_predictor = None
+        self.horizon_teacher = None
+        if self.masked_horizon:
+            if self.task_name != 'long_term_forecast':
+                raise ValueError('--masked_horizon is only implemented for long_term_forecast')
+            from models.masked_horizon import MaskedHorizonTeacher
+            self.horizon_teacher = MaskedHorizonTeacher(
+                seq_len=configs.seq_len,
+                pred_len=configs.pred_len,
+                periodicity=getattr(configs, 'horizon_periodicity', 1),
+                align_const=getattr(configs, 'horizon_align_const', 0.4),
+                norm_const=getattr(configs, 'horizon_norm_const', 0.4),
+                ckpt_dir=getattr(configs, 'mae_ckpt_dir', './ckpt/'),
+                per_var=self.per_var_teacher,
+                chunk_size=getattr(configs, 'horizon_chunk_size', 32),
+            )
+            self.horizon_dim = self.horizon_teacher.hidden_size
+            self.horizon_predictor = JEPAPredictor(
+                student_dim=configs.d_model,
+                teacher_dim=self.horizon_dim,
+                hidden_dim=getattr(configs, 'jepa_hidden_dim', 512),
+                input_shape=predictor_input_shape,
+                per_var=self.per_var_teacher,
+            )
+            print(f"Horizon predictor: student -> {self.horizon_dim} "
+                  f"(per_var={self.per_var_teacher})")
         
         # Store patch_num for classification head
         self.patch_num = patch_num if patch_num is not None else 1
@@ -566,19 +545,16 @@ class Model(nn.Module):
         # Prediction head for forecasting task
         if self.task_name != 'classification':
             self.forecast_head = nn.Linear(self.student_dim, configs.pred_len * configs.c_out)
-            print(f"✅ Forecast head: {self.student_dim} -> {configs.pred_len * configs.c_out}")
+            print(f"Forecast head: {self.student_dim} -> {configs.pred_len * configs.c_out}")
         
         # Classification head
         if self.task_name == 'classification':
             self.num_classes = configs.num_class
-            # Prefer the backbone's NATIVE classification head when it exposes a
-            # classification_decode that consumes our encoding (iTransformer). This
-            # makes JEPAVTS a clean "+JEPA on the same model" (same head as the
-            # baseline), exactly like forecasting reuses forecast_decode. Backbones
-            # without a compatible native decode fall back to the generic head.
+            # Use the backbone's native classification head when it has a compatible
+            # classification_decode (iTransformer/Crossformer); else the generic head.
             self.use_native_cls_head = self.student_model_name in ('iTransformer', 'Crossformer')
             if self.use_native_cls_head:
-                print("✅ Classification head: NATIVE backbone "
+                print("Classification head: NATIVE backbone "
                       f"({self.student_model_name}.classification_decode)")
             else:
                 # Calculate flatten dimension for the generic head by encoding type
@@ -602,7 +578,7 @@ class Model(nn.Module):
                     nn.Dropout(0.1),
                     nn.Linear(configs.d_model, self.num_classes)
                 )
-                print(f"✅ Classification head: {flatten_dim} -> {self.num_classes} classes")
+                print(f"Classification head: {flatten_dim} -> {self.num_classes} classes")
         
         # Learnable loss weights (uncertainty-based)
         self.use_learned_loss_weights = getattr(configs, 'learned_loss_weights', False)
@@ -610,32 +586,43 @@ class Model(nn.Module):
             # Initialize log-variance parameters (start with equal weighting ~0.5 each)
             self.w_pred = nn.Parameter(torch.tensor([0.0]))  # log(σ²) for prediction loss
             self.w_jepa = nn.Parameter(torch.tensor([0.0]))  # log(σ²) for JEPA loss
-            print(f"✅ Using learned loss weights (uncertainty-based)")
+            print(f"Using learned loss weights (uncertainty-based)")
 
         print("\n" + "="*50)
         print("JEPAVTS Model Initialized Successfully!")
         print("="*50 + "\n")
-        
-    # def _build_student_model(self, model_name, configs):
-    #     """Build the student time series model"""
-    #     if model_name == 'PatchTST':
-    #         from models.PatchTST import Model as PatchTSTModel
-    #         return PatchTSTModel(configs)
-    #     elif model_name == 'TimesNet':
-    #         from models.TimesNet import Model as TimesNetModel
-    #         return TimesNetModel(configs)
-    #     elif model_name == 'DLinear':
-    #         from models.DLinear import Model as DLinearModel
-    #         return DLinearModel(configs)
-    #     elif model_name == 'iTransformer':
-    #         from models.iTransformer import Model as iTransformerModel
-    #         return iTransformerModel(configs)
-    #     elif model_name == 'Transformer':
-    #         from models.Transformer import Model as TransformerModel
-    #         return TransformerModel(configs)
-    #     else:
-    #         raise NotImplementedError(f"Student model {model_name} not implemented")
-    
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, 'masked_horizon', False) and self.horizon_teacher is not None:
+            self.horizon_teacher.eval()
+        return self
+
+    def state_dict(self, *args, **kwargs):
+        sd = super().state_dict(*args, **kwargs)
+        drop = [k for k in sd if k.startswith('horizon_teacher.')]
+        for k in drop:
+            del sd[k]
+        return sd
+
+    def load_state_dict(self, state_dict, strict=True):
+        if getattr(self, 'masked_horizon', False):
+            return super().load_state_dict(state_dict, strict=False)
+        return super().load_state_dict(state_dict, strict=strict)
+
+    def _pack_train(self, *outputs, jepa_enc=None):
+        """Append horizon prediction as the last element when --masked_horizon."""
+        if self.masked_horizon:
+            if jepa_enc is None or self.horizon_predictor is None:
+                raise RuntimeError('masked_horizon requires a JEPA-shaped student encoding')
+            return outputs + (self.horizon_predictor(jepa_enc),)
+        return outputs
+
+    def horizon_teacher_forward(self, x_enc):
+        """Frozen MAE masked-horizon target. x_enc: [B, seq_len, nvars]."""
+        with torch.no_grad():
+            return self.horizon_teacher(x_enc)
+
     def _build_student_model(self, model_name, configs):
         """Build student model using exp_basic's model registry"""
         from exp.exp_basic import Exp_Basic
@@ -698,7 +685,7 @@ class Model(nn.Module):
 
         For iTransformer, `encode()` returns [B, nvars(+covariate tokens), d_model]
         (logic untouched in the model). Here we keep only the nvars variable tokens
-        and add a trailing dim → [B, nvars, d_model, 1], matching the predictor's
+        and add a trailing dim -> [B, nvars, d_model, 1], matching the predictor's
         input_shape=(enc_in, d_model, 1). For every other backbone this is a no-op.
 
         Note: decoding always uses the full (unmodified) encoding; only the JEPA
@@ -735,7 +722,7 @@ class Model(nn.Module):
     def _timemixer_encode(self, student, x_enc, x_mark_enc, x_dec, x_mark_dec):
         """
         Encode with TimeMixer and reshape selected-scale encoding to 4D for JEPA.
-        Scale is controlled by timemixer_jepa_scale ('fine' → [0], 'coarse' → [-1]).
+        Scale is controlled by timemixer_jepa_scale ('fine' -> [0], 'coarse' -> [-1]).
         Returns: (jepa_encoding [B, N, d_model, T], enc_out_list, x_list, B_size)
         """
         enc_out_list, x_list, B = student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
@@ -756,15 +743,20 @@ class Model(nn.Module):
             predicted_teacher_encoding = self._predict_teacher(jepa_encoding)
             forecast_output = self.student.forecast_decode(B, enc_out_list, x_list)
             if return_all:
-                return forecast_output, jepa_encoding, predicted_teacher_encoding
+                return self._pack_train(
+                    forecast_output, jepa_encoding, predicted_teacher_encoding,
+                    jepa_enc=jepa_encoding)
             return forecast_output
 
         student_encoding, means, stdev = self.student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
-        predicted_teacher_encoding = self._predict_teacher(self._to_jepa_encoding(student_encoding))
+        jepa_enc = self._to_jepa_encoding(student_encoding)
+        predicted_teacher_encoding = self._predict_teacher(jepa_enc)
         forecast_output = self.student.forecast_decode(student_encoding, means, stdev)
         
         if return_all:
-            return forecast_output, student_encoding, predicted_teacher_encoding
+            return self._pack_train(
+                forecast_output, student_encoding, predicted_teacher_encoding,
+                jepa_enc=jepa_enc)
         
         return forecast_output
 
@@ -783,19 +775,22 @@ class Model(nn.Module):
             fused_enc_list = self._inject_fused_into_enc_list(enc_list1, combined_encoding, B1)
             forecast_output = self.student1.forecast_decode(B1, fused_enc_list, x_list1)
             if return_all:
-                return forecast_output, predicted_teacher_encoding
+                return self._pack_train(
+                    forecast_output, predicted_teacher_encoding, jepa_enc=jepa_enc2)
             return forecast_output
 
         student_encoding1, means1, stdev1 = self.student1.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         student_encoding2, means2, stdev2 = self.student2.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
         
-        predicted_teacher_encoding = self._predict_teacher(self._to_jepa_encoding(student_encoding2))
+        jepa_enc = self._to_jepa_encoding(student_encoding2)
+        predicted_teacher_encoding = self._predict_teacher(jepa_enc)
 
         combined_encoding = self.encoder_fusion(student_encoding1, student_encoding2)
         forecast_output = self.student1.forecast_decode(combined_encoding, means1, stdev1)
 
         if return_all:
-            return forecast_output, predicted_teacher_encoding
+            return self._pack_train(
+                forecast_output, predicted_teacher_encoding, jepa_enc=jepa_enc)
         
         return forecast_output
     
@@ -831,7 +826,7 @@ class Model(nn.Module):
             fused_enc_list = self._inject_fused_into_enc_list(enc_list, combined_encoding, B)
             forecast_output = self.student.forecast_decode(B, fused_enc_list, x_list)
             if return_all:
-                return forecast_output, None
+                return self._pack_train(forecast_output, None, jepa_enc=jepa_enc)
             return forecast_output
 
         student_encoding, means, stdev = self.student.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
@@ -840,7 +835,8 @@ class Model(nn.Module):
         combined_encoding = self.dino_fusion_module(student_encoding, dino_enc)
         forecast_output = self.student.forecast_decode(combined_encoding, means, stdev)
         if return_all:
-            return forecast_output, None
+            return self._pack_train(
+                forecast_output, None, jepa_enc=self._to_jepa_encoding(student_encoding))
         return forecast_output
 
     def student_forward_no_dino(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
@@ -859,7 +855,7 @@ class Model(nn.Module):
             fused_enc_list = self._inject_fused_into_enc_list(enc_list1, combined_encoding, B1)
             forecast_output = self.student1.forecast_decode(B1, fused_enc_list, x_list1)
             if return_all:
-                return forecast_output, None
+                return self._pack_train(forecast_output, None, jepa_enc=jepa_enc2)
             return forecast_output
 
         student_encoding1, means1, stdev1 = self.student1.encode(x_enc, x_mark_enc, x_dec, x_mark_dec)
@@ -869,7 +865,8 @@ class Model(nn.Module):
         forecast_output = self.student1.forecast_decode(combined_encoding, means1, stdev1)
 
         if return_all:
-            return forecast_output, None
+            return self._pack_train(
+                forecast_output, None, jepa_enc=self._to_jepa_encoding(student_encoding2))
         return forecast_output
 
     def student_forward_multi_encoder(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
@@ -877,8 +874,8 @@ class Model(nn.Module):
         Multi-encoder forward: k student encoders, fused for decode.
         
         Two modes controlled by use_multi_predictor:
-          - multi_predictor=True  (opt 3): predictor_i(student_encoding_i) → z'_i
-          - multi_predictor=False (opt 4): predictor(fused_encoding) → z' (shared)
+          - multi_predictor=True  (opt 3): predictor_i(student_encoding_i) -> z'_i
+          - multi_predictor=False (opt 4): predictor(fused_encoding) -> z' (shared)
         """
         if self.encoding_type == '4D_timemixer':
             tm_results = [
@@ -900,7 +897,9 @@ class Model(nn.Module):
             forecast_output = self.students_multi[0].forecast_decode(B0, fused_enc_list, x_list_0)
 
             if return_all:
-                return forecast_output, jepa_encodings, predicted_teacher
+                return self._pack_train(
+                    forecast_output, jepa_encodings, predicted_teacher,
+                    jepa_enc=fused_jepa)
             return forecast_output
 
         results = [
@@ -929,7 +928,9 @@ class Model(nn.Module):
             fused_encoding, means_0, stdev_0)
         
         if return_all:
-            return forecast_output, student_encodings, predicted_teacher
+            return self._pack_train(
+                forecast_output, student_encodings, predicted_teacher,
+                jepa_enc=self._to_jepa_encoding(fused_encoding))
         
         return forecast_output
     
@@ -963,7 +964,11 @@ class Model(nn.Module):
             forecast_output = self.student_forecast.forecast_decode(fc_B, fused_enc_list, fc_x_list)
 
             if return_all:
-                return forecast_output, jepa_encodings, predicted_teacher
+                horizon_enc = fused_jepa if not self.use_multi_predictor else torch.stack(
+                    jepa_encodings, dim=0).mean(dim=0)
+                return self._pack_train(
+                    forecast_output, jepa_encodings, predicted_teacher,
+                    jepa_enc=horizon_enc)
             return forecast_output
 
         # Non-TimeMixer path
@@ -989,10 +994,13 @@ class Model(nn.Module):
         forecast_output = self.student_forecast.forecast_decode(fused, fc_means, fc_stdev)
 
         if return_all:
-            return forecast_output, jepa_encodings, predicted_teacher
+            horizon_enc = self._to_jepa_encoding(
+                fused_jepa if not self.use_multi_predictor
+                else torch.stack(jepa_encodings, dim=0).mean(dim=0))
+            return self._pack_train(
+                forecast_output, jepa_encodings, predicted_teacher,
+                jepa_enc=horizon_enc)
         return forecast_output
-
-    def anomaly_forward(self, x_enc, return_all=False):
         """
         Single-encoder anomaly detection: reconstruct the input window and, during
         training, align the student encoding to the teacher.
@@ -1045,19 +1053,12 @@ class Model(nn.Module):
             enc = enc.reshape(B, N, T, D).permute(0, 1, 3, 2)  # [B, N, d_model, T]
             return enc
         if self.student_model_name == 'iTransformer':
-            # iTransformer is inverted: classification_encode returns one token
-            # per variable [B, N, d_model]. Add a trailing patch dim so it reuses
-            # the 4D per-var predictor / fusion / classification head machinery
-            # (patch_num=1). Each variable token then aligns with its own DINO
-            # per-variable teacher embedding.
+            # Inverted: one token per variable [B, N, d_model]; add a patch dim for
+            # the 4D per-var machinery (patch_num=1).
             enc = student.classification_encode(x_enc, None)  # [B, N, d_model]
             return enc.unsqueeze(-1)                          # [B, N, d_model, 1]
         if self.student_model_name == 'Crossformer':
-            # Crossformer.classification_encode returns the last encoder feature
-            # map [B, N, out_seg_num, d_model]. Permute to the 4D convention
-            # [B, N, d_model, out_seg_num] so it reuses the per-var predictor /
-            # fusion / native-head machinery. Each variable's [d_model, seg_num]
-            # token aligns with its own DINO per-variable teacher embedding.
+            # [B, N, out_seg_num, d_model] -> 4D convention [B, N, d_model, out_seg_num].
             enc = student.classification_encode(x_enc, None)  # [B, N, seg_num, d_model]
             return enc.permute(0, 1, 3, 2)                    # [B, N, d_model, seg_num]
         return student.encode(x_enc)
@@ -1066,7 +1067,7 @@ class Model(nn.Module):
         """Map a (possibly fused) student encoding to class logits.
 
         Uses the backbone's NATIVE classification head (owner.classification_decode)
-        when available — same head the baseline uses — else the generic JEPAVTS head.
+        when available - same head the baseline uses - else the generic JEPAVTS head.
         `owner` is the student whose native head/weights should decode (the task
         encoder: self.student / self.student1 / self.student_forecast).
         """
