@@ -144,7 +144,8 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         csv_path = os.path.join(path, 'training_log.csv')
         csv_file = open(csv_path, 'w', newline='')
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(['epoch', 'train_loss', 'train_pred_loss', 'train_jepa_loss', 'vali_loss', 'test_loss'])
+        csv_writer.writerow(['epoch', 'train_loss', 'train_pred_loss', 'train_jepa_loss',
+                             'train_horizon_loss', 'vali_loss', 'test_loss'])
         
         time_now = time.time()
         train_steps = len(train_loader)
@@ -155,6 +156,7 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         
         jepa_weight = getattr(self.args, 'jepa_weight', 1.0)
         jepa_loss_type = getattr(self.args, 'jepa_loss_type', 'mse')
+        horizon_weight = getattr(self.args, 'horizon_weight', 1.0)
         
         # Get model reference for architecture check
         model_ref = self.model.module if hasattr(self.model, 'module') else self.model
@@ -169,11 +171,13 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                           if model_ref.multi_rendering
                           else "Single rendering")
         
-        print(f"\n🎯 Training Configuration:")
+        print(f"\nTraining Configuration:")
         print(f"   - Architecture: {arch_type}")
         print(f"   - Rendering: {rendering_info}")
         print(f"   - JEPA Weight: {jepa_weight}")
         print(f"   - JEPA Loss Type: {jepa_loss_type}")
+        if getattr(model_ref, 'masked_horizon', False):
+            print(f"   - Masked-horizon: on (weight={horizon_weight})")
         print(f"   - Batch Size: {self.args.batch_size}")
         print(f"   - Learning Rate: {self.args.learning_rate}")
         print(f"   - Train Steps per Epoch: {train_steps}\n")
@@ -183,6 +187,7 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
             train_loss = []
             train_pred_loss = []
             train_jepa_loss = []
+            train_horizon_loss = []
             
             self.model.train()
             epoch_time = time.time()
@@ -200,9 +205,7 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 
-                # 1. Teacher forward (frozen, no grad). NO-DINO builds no teacher;
-                #    DINO-DIRECT calls the teacher itself inside forward. Either
-                #    way the exp-level teacher/JEPA loss is not used.
+                # 1. Teacher forward (frozen, no grad). Skipped for NO-DINO / DINO-DIRECT.
                 no_jepa = getattr(model_ref, 'no_dino', False) or getattr(model_ref, 'dino_direct', False)
                 if no_jepa:
                     teacher_encoding = None
@@ -211,7 +214,11 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                 
                 # 2. Student forward - handle all architectures
                 model_outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                
+                predicted_horizon = None
+                if getattr(model_ref, 'masked_horizon', False):
+                    predicted_horizon = model_outputs[-1]
+                    model_outputs = model_outputs[:-1]
+
                 if no_jepa:
                     # NO-DINO / DINO-DIRECT: (predictions, None) - task loss only.
                     predictions = model_outputs[0]
@@ -257,12 +264,21 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                     loss = pred_loss + jepa_loss_term
                     weight_info = None
 
+                horizon_loss_scalar = 0.0
+                if predicted_horizon is not None:
+                    horizon_target = model_ref.horizon_teacher_forward(batch_x)
+                    horizon_raw = self._jepa_loss(
+                        predicted_horizon, horizon_target.detach(), jepa_loss_type)
+                    loss = loss + horizon_weight * horizon_raw
+                    horizon_loss_scalar = horizon_raw.item()
+
                 train_loss.append(loss.item())
                 train_pred_loss.append(pred_loss.item())
                 train_jepa_loss.append(jepa_loss_scalar)
+                train_horizon_loss.append(horizon_loss_scalar)
                 
                 if (i + 1) % 100 == 0:
-                    print(f"\t📈 Iter: {i+1}/{train_steps}, Epoch: {epoch+1}/{self.args.train_epochs} [{arch_type}]")
+                    print(f"\tIter: {i+1}/{train_steps}, Epoch: {epoch+1}/{self.args.train_epochs} [{arch_type}]")
                     print(f"\t   Total Loss: {loss.item():.7f}")
                     print(f"\t   Pred Loss: {pred_loss.item():.7f}")
                     if model_ref.multi_rendering:
@@ -272,49 +288,54 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
                         print(f"\t   JEPA Loss (combined term): {jepa_loss_term.item():.7f}")
                     else:
                         print(f"\t   JEPA Loss: {jepa_loss_scalar:.7f}")
+                    if predicted_horizon is not None:
+                        print(f"\t   Horizon Loss: {horizon_loss_scalar:.7f}")
                     if weight_info:
                         print(f"\t   Learned Weights: pred={weight_info['pred_weight']:.4f}, jepa={weight_info['jepa_weight']:.4f}")
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    print(f'\t   ⏱️  Speed: {speed:.4f}s/iter; Left: {left_time/60:.2f}min\n')
+                    print(f'\t    Speed: {speed:.4f}s/iter; Left: {left_time/60:.2f}min\n')
                     iter_count = 0
                     time_now = time.time()
                 
                 loss.backward()
                 model_optim.step()
             
-            print(f"✅ Epoch {epoch+1} completed in {(time.time() - epoch_time)/60:.2f} minutes")
+            print(f"Epoch {epoch+1} completed in {(time.time() - epoch_time)/60:.2f} minutes")
             train_loss = np.average(train_loss)
             train_pred_loss = np.average(train_pred_loss)
             train_jepa_loss = np.average(train_jepa_loss)
+            train_horizon_loss = np.average(train_horizon_loss)
             
-            print(f"📊 Validating...")
+            print(f"Validating...")
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
             
             print(f"\n{'='*70}")
-            print(f"📊 Epoch {epoch+1} Summary:")
-            print(f"   Train Loss: {train_loss:.7f} (Pred: {train_pred_loss:.7f}, JEPA: {train_jepa_loss:.7f})")
+            print(f"Epoch {epoch+1} Summary:")
+            print(f"   Train Loss: {train_loss:.7f} (Pred: {train_pred_loss:.7f}, "
+                  f"JEPA: {train_jepa_loss:.7f}, Horizon: {train_horizon_loss:.7f})")
             print(f"   Vali Loss:  {vali_loss:.7f}")
             print(f"   Test Loss:  {test_loss:.7f}")
             print(f"{'='*70}\n")
             
-            csv_writer.writerow([epoch + 1, train_loss, train_pred_loss, train_jepa_loss, vali_loss, test_loss])
+            csv_writer.writerow([epoch + 1, train_loss, train_pred_loss, train_jepa_loss,
+                                 train_horizon_loss, vali_loss, test_loss])
             csv_file.flush()
             
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
-                print("⚠️ Early stopping triggered!")
+                print("Early stopping triggered!")
                 break
             
             adjust_learning_rate(model_optim, epoch + 1, self.args)
         
         csv_file.close()
-        print(f"📄 Training log saved to {csv_path}")
+        print(f"Training log saved to {csv_path}")
         
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
-        print(f"✅ Best model loaded from {best_model_path}")
+        print(f"Best model loaded from {best_model_path}")
         
         return self.model
     
@@ -343,13 +364,11 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         if test:
             transfer_ckpt = getattr(self.args, 'transfer_checkpoint', '')
             ckpt_path = transfer_ckpt if transfer_ckpt else os.path.join('./checkpoints/' + setting, 'checkpoint.pth')
-            print('📂 Loading model from {}...'.format(ckpt_path))
+            print('Loading model from {}...'.format(ckpt_path))
             state_dict = torch.load(ckpt_path, map_location='cpu')
             if transfer_ckpt:
-                # Cross-dataset transfer: target may have a different variable count.
-                # Drop checkpoint tensors whose shape mismatches the (target-enc_in)
-                # model — e.g. the TimeMixer student's RevIN normalize_layers affine
-                # of shape [enc_in]. See _load_transfer_state_dict for rationale.
+                # Cross-dataset transfer: skip checkpoint tensors whose shape doesn't
+                # match the target model (e.g. TimeMixer RevIN affines of shape [enc_in]).
                 self._load_transfer_state_dict(state_dict)
             else:
                 self.model.load_state_dict(state_dict)
@@ -363,7 +382,7 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         noise_ctx = self._make_noise_ctx(test_data)
 
         self.model.eval()
-        print("🧪 Running test...")
+        print("Running test...")
         
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
@@ -408,7 +427,7 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         
         preds = np.concatenate(preds, axis=0)
         trues = np.concatenate(trues, axis=0)
-        print(f'📊 Test shape: {preds.shape}, {trues.shape}')
+        print(f'Test shape: {preds.shape}, {trues.shape}')
         
         folder_path = './results/' + setting + '/'
         if not os.path.exists(folder_path):
@@ -416,7 +435,7 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print(f'\n{"="*70}')
-        print(f'📊 Test Results:')
+        print(f'Test Results:')
         print(f'   MSE:  {mse:.7f}')
         print(f'   MAE:  {mae:.7f}')
         print(f'   RMSE: {rmse:.7f}')
@@ -433,6 +452,6 @@ class Exp_JEPA_VTS_Long_Term_Forecast(Exp_Basic):
         np.save(folder_path + 'pred.npy', preds)
         np.save(folder_path + 'true.npy', trues)
         
-        print(f'✅ Results saved to {folder_path}')
+        print(f'Results saved to {folder_path}')
         
         return
