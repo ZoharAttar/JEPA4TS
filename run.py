@@ -4,8 +4,6 @@ import torch
 import torch.backends
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
 from exp.exp_jepa_vts_long_term_forecasting import Exp_JEPA_VTS_Long_Term_Forecast
-from exp.exp_imputation import Exp_Imputation
-from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
 from exp.exp_anomaly_detection import Exp_Anomaly_Detection
 from exp.exp_jepa_vts_anomaly_detection import Exp_JEPA_VTS_Anomaly_Detection
 from exp.exp_classification import Exp_Classification
@@ -19,7 +17,7 @@ if __name__ == '__main__':
 
     # basic config
     parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
-                        help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
+                        help='task name, options:[long_term_forecast, classification, anomaly_detection]')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='Autoformer',
@@ -211,6 +209,25 @@ if __name__ == '__main__':
                         help='TimeMixer scale for JEPA branch: fine=enc_out_list[0], '
                              'coarse=enc_out_list[-1]. Requires down_sampling_layers>0 for coarse.')
 
+    parser.add_argument('--masked_horizon', action='store_true', default=False,
+                        help='Add a frozen MAE masked-horizon teacher: VisionTS-style image '
+                             '(lookback on the left, zeros on the right). Student predicts '
+                             'mean-pooled decoder latents of the masked future patches. '
+                             'Training only; no extra cost at inference. Does not reuse DINO caches.')
+    parser.add_argument('--horizon_weight', type=float, default=1.0,
+                        help='Weight for the masked-horizon alignment loss (used with --masked_horizon).')
+    parser.add_argument('--horizon_periodicity', type=int, default=1,
+                        help='VisionTS periodicity for folding the lookback into a 2D canvas.')
+    parser.add_argument('--horizon_align_const', type=float, default=0.4,
+                        help='VisionTS align_const: fraction of the image reserved for lookback patches.')
+    parser.add_argument('--horizon_norm_const', type=float, default=0.4,
+                        help='VisionTS norm_const for instance-normalising the lookback before rendering.')
+    parser.add_argument('--horizon_chunk_size', type=int, default=32,
+                        help='MAE forward chunk over (batch * nvars) images to limit VRAM.')
+    parser.add_argument('--mae_ckpt_dir', type=str, default='./ckpt/',
+                        help='Directory for the MAE-base visualize checkpoint '
+                             '(downloaded on first --masked_horizon run).')
+
     # TimeXer
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
 
@@ -264,10 +281,6 @@ if __name__ == '__main__':
           Exp = Exp_JEPA_VTS_Long_Term_Forecast
       else:
           Exp = Exp_Long_Term_Forecast
-    elif args.task_name == 'short_term_forecast':
-        Exp = Exp_Short_Term_Forecast
-    elif args.task_name == 'imputation':
-        Exp = Exp_Imputation
     elif args.task_name == 'anomaly_detection':
         if args.model == 'JEPAVTS':
             Exp = Exp_JEPA_VTS_Anomaly_Detection
