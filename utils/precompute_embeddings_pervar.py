@@ -115,6 +115,16 @@ DATASET_CONFIGS = {
         'features': 'M',
         'target': 'OT',
     },
+    'treasury_yields': {
+        'data': 'custom',
+        'root_path': './dataset/treasury_yields/',
+        'data_path': 'treasury_yields.csv',
+        # Train uses --data custom → {root}/dino_embeddings_custom_{method}_pervar
+        'cache_base': './dataset/treasury_yields/dino_embeddings_custom',
+        'freq': 'd',
+        'features': 'M',
+        'target': 'OT',
+    },
     'national_illness': {
         'data': 'custom',
         'root_path': './dataset/',
