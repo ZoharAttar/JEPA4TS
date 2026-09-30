@@ -732,6 +732,20 @@ class Model(nn.Module):
         jepa_encoding = enc_jepa.reshape(B, N, T, D).permute(0, 1, 3, 2)  # [B, N, d_model, T]
         return jepa_encoding, enc_out_list, x_list, B
 
+    def _timemixer_imputation_encode(self, student, x_enc, x_mark_enc, mask):
+        """TimeMixer imputation encode, with the JEPA scale reshaped to 4D.
+
+        Same layout as _timemixer_encode: [B, N, d_model, T_scale].
+        The reconstruction head still reads the finest scale inside
+        imputation_decode; this view is only for the predictor.
+        """
+        enc_out_list, means, stdev, B = student.imputation_encode(x_enc, x_mark_enc, mask)
+        enc_jepa = enc_out_list[self.timemixer_jepa_idx]  # [B*N, T, d_model]
+        N = self.configs.enc_in
+        T, D = enc_jepa.shape[1], enc_jepa.shape[2]
+        jepa_encoding = enc_jepa.reshape(B, N, T, D).permute(0, 1, 3, 2)  # [B, N, d_model, T]
+        return jepa_encoding, enc_out_list, means, stdev, B
+
     def student_forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_all=False):
         """
         Student forward pass
@@ -1001,6 +1015,8 @@ class Model(nn.Module):
                 forecast_output, jepa_encodings, predicted_teacher,
                 jepa_enc=horizon_enc)
         return forecast_output
+
+    def anomaly_forward(self, x_enc, return_all=False):
         """
         Single-encoder anomaly detection: reconstruct the input window and, during
         training, align the student encoding to the teacher.
@@ -1175,6 +1191,33 @@ class Model(nn.Module):
             return class_logits, jepa_encodings, predicted_teacher
         return class_logits
 
+    def imputation_forward(self, x_enc, x_mark_enc, mask, return_all=False):
+        """
+        Single TimeMixer encoder. The student sees the masked series.
+
+        Reconstruction uses the finest scale (enc_out_list[0]), matching
+        TimeMixer.imputation. The JEPA predictor reads timemixer_jepa_scale
+        (fine or coarse). During training, return
+        (reconstruction, jepa_encoding, predicted_teacher_encoding).
+        The caller compares predicted_teacher_encoding to the teacher embedding
+        of the *clean* window.
+        """
+        if self.student_model_name != 'TimeMixer' or self.encoding_type != '4D_timemixer':
+            raise NotImplementedError(
+                'JEPA imputation supports the TimeMixer student with '
+                'channel_independence=1.')
+        if mask is None:
+            raise ValueError('imputation requires a mask (1 = observed, 0 = missing)')
+
+        jepa_encoding, enc_out_list, means, stdev, B = self._timemixer_imputation_encode(
+            self.student, x_enc, x_mark_enc, mask)
+        recon = self.student.imputation_decode(B, enc_out_list, means, stdev)
+
+        if return_all:
+            predicted_teacher_encoding = self._predict_teacher(jepa_encoding)
+            return recon, jepa_encoding, predicted_teacher_encoding
+        return recon
+
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         """
         Main forward - behavior depends on task_name, training mode and architecture
@@ -1212,6 +1255,18 @@ class Model(nn.Module):
                 return self.anomaly_forward_dual_encoder(
                     x_enc, return_all=self.training)
             return self.anomaly_forward(x_enc, return_all=self.training)
+
+        # Imputation. The student sees the masked series; the caller feeds the
+        # clean window to the teacher. Single TimeMixer encoder only: the
+        # imputation head reads the finest scale, so dual-encoder fusion
+        # (injected at timemixer_jepa_scale) is not wired.
+        if self.task_name == 'imputation':
+            if self.use_dual_encoder or self.use_multi_encoder or self.no_dino or self.dino_direct:
+                raise NotImplementedError(
+                    'JEPA imputation is implemented for a single TimeMixer encoder. '
+                    'Drop --use_dual_encoder / --multi_encoder / --no_dino / --dino_direct.')
+            return self.imputation_forward(
+                x_enc, x_mark_enc, mask, return_all=self.training)
 
         # Forecasting task
         if self.no_dino:
