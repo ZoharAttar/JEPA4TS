@@ -458,7 +458,16 @@ class Model(nn.Module):
         dec_out = self.normalize_layers[0](dec_out, 'denorm')
         return dec_out
 
-    def imputation(self, x_enc, x_mark_enc, mask):
+    def imputation_encode(self, x_enc, x_mark_enc, mask):
+        """Mask-aware normalize, embed, and mix.
+
+        Returns the multi-scale encoder tokens so JEPA can align one scale
+        before the projection head runs.
+
+        enc_out_list[i] is scale i (0 = finest). With channel independence each
+        tensor is [B * C, T_i, d_model]; otherwise [B, T_i, d_model].
+        B is the batch size imputation_decode uses for the reshape.
+        """
         means = torch.sum(x_enc, dim=1) / torch.sum(mask == 1, dim=1)
         means = means.unsqueeze(1).detach()
         x_enc = x_enc - means
@@ -498,6 +507,10 @@ class Model(nn.Module):
         for i in range(self.layer):
             enc_out_list = self.pdm_blocks[i](enc_out_list)
 
+        return enc_out_list, means, stdev, B
+
+    def imputation_decode(self, B, enc_out_list, means, stdev):
+        """Project the finest scale back to the series and undo normalization."""
         dec_out = self.projection_layer(enc_out_list[0])
         dec_out = dec_out.reshape(B, self.configs.c_out, -1).permute(0, 2, 1).contiguous()
 
@@ -506,6 +519,10 @@ class Model(nn.Module):
         dec_out = dec_out + \
                   (means[:, 0, :].unsqueeze(1).repeat(1, self.seq_len, 1))
         return dec_out
+
+    def imputation(self, x_enc, x_mark_enc, mask):
+        enc_out_list, means, stdev, B = self.imputation_encode(x_enc, x_mark_enc, mask)
+        return self.imputation_decode(B, enc_out_list, means, stdev)
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
