@@ -31,10 +31,17 @@ class DINOTeacher(nn.Module):
         
         suffix = "_pervar" if per_var else ""
         root = root_path.rstrip('/') if root_path else "./dataset/ETT-small/"
+        # VisionTS++ teacher caches live under a `visionts_embeddings_` prefix
+        # (written by utils/precompute_embeddings_visionts.py); DINO caches use
+        # `dino_embeddings_`. Everything else (hash-based [N, dim] loading) is
+        # identical, so a VisionTS++ teacher is a drop-in for the DINO one.
+        prefix = ("visionts_embeddings"
+                  if (rendering_method and rendering_method.startswith("VisionTS"))
+                  else "dino_embeddings")
         if rendering_method:
-            self.cache_dir = f"{root}/dino_embeddings_{dataset_name}_{rendering_method}{suffix}"
+            self.cache_dir = f"{root}/{prefix}_{dataset_name}_{rendering_method}{suffix}"
         else:
-            self.cache_dir = f"{root}/dino_embeddings_{dataset_name}{suffix}"
+            self.cache_dir = f"{root}/{prefix}_{dataset_name}{suffix}"
         self.hidden_size = hidden_size
         
         if not os.path.exists(self.cache_dir):
