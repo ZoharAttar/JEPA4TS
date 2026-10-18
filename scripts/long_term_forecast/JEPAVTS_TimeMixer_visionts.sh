@@ -2,7 +2,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # JEPAVTS + TimeMixer student, VisionTS++ teacher (instead of DINO).
 # Same configs as JEPAVTS_TimeMixer_all_datasets.sh — ONLY the teacher changes
-# (RENDER=VisionTSpp). For each (dataset, horizon): single-encoder AND dual.
+# (RENDER=VisionTSpp). SINGLE-encoder only (one job per dataset+horizon).
 #
 # PREREQUISITE — precompute the VisionTS++ per-variable teacher embeddings first:
 #
@@ -139,7 +139,7 @@ for name in $DATASETS; do
   cfg="$(get_cfg "$name")" || exit 1
   horizons="$(printf '%s' "$cfg" | awk -F'|' '{print $NF}')"
   for pred_len in $horizons; do
-    job_list="$job_list ${name}:${pred_len}:single ${name}:${pred_len}:dual"
+    job_list="$job_list ${name}:${pred_len}:single"
   done
 done
 
