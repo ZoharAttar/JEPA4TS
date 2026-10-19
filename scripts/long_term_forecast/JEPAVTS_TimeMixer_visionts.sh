@@ -30,10 +30,12 @@ LOG_DIR="${LOG_DIR:-logs/jepavts_timemixer_visionts}"
 
 MODEL=JEPAVTS
 STUDENT=TimeMixer
-RENDER=VisionTSpp    # ← teacher = VisionTS++ (was RP for DINO). Must be precomputed.
-JEPA_WEIGHT=1
-JEPA_SCALE=coarse    # timemixer_jepa_scale: fine | coarse
-JEPA_LOSS=mse        # JEPA alignment loss: mse | cosine
+# Teacher cache tag (must be precomputed). Override via env, e.g.:
+#   RENDER=VisionTSpp_meanpool bash scripts/long_term_forecast/JEPAVTS_TimeMixer_visionts.sh
+RENDER="${RENDER:-VisionTSpp}"   # VisionTSpp (CLS) | VisionTSpp_meanpool
+JEPA_WEIGHT="${JEPA_WEIGHT:-1}"
+JEPA_SCALE="${JEPA_SCALE:-coarse}"   # timemixer_jepa_scale: fine | coarse
+JEPA_LOSS="${JEPA_LOSS:-mse}"        # JEPA alignment loss: mse | cosine
 
 # Shared training hyper-params
 DS_WINDOW=2
