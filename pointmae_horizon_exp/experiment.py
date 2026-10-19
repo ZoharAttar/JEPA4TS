@@ -18,7 +18,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa
 from pointmae_model import load_pointmae
 
 CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pointmae_pretrain.pth')
-ETTH1 = '/Users/zattar/Documents/University/Master/JEPA4TS/dataset/ETT-small/ETTh1.csv'
+ETTH1 = '/dataset/ETT-small/ETTh1.csv'
 VARS = ['HUFL', 'HULL', 'MUFL', 'MULL', 'LUFL', 'LULL', 'OT']
 NVAR = len(VARS)
 T = 146                      # timesteps per window  (T*7 = 1022 points ~ 1024)
