@@ -152,12 +152,16 @@ def load_visionts_encoder(arch, ckpt_path, ckpt_dir, device):
 
 
 @torch.no_grad()
-def encode_cls(vision_model, images, chunk=16):
-    """images: [N, 3, H, W] -> CLS embeddings [N, D] at mask_ratio=0.
+def encode_images(vision_model, images, pool='cls', chunk=16):
+    """images: [N, 3, H, W] -> teacher embeddings [N, D] at mask_ratio=0.
+
+    pool:
+      'cls'  -> the CLS token               latent[:, 0, :]
+      'mean' -> mean over the patch tokens  latent[:, 1:, :].mean(1)
 
     Passes deterministic ascending `noise` so random_masking keeps all patches
-    in natural order (mask_ratio=0 keeps everything; order is irrelevant to the
-    CLS token, but this makes the embeddings fully reproducible).
+    in natural order (mask_ratio=0 keeps everything; this makes the embeddings
+    fully reproducible).
     """
     n_patches = vision_model.patch_embed.num_patches
     outs = []
@@ -166,7 +170,10 @@ def encode_cls(vision_model, images, chunk=16):
         noise = torch.arange(n_patches, device=x.device, dtype=x.dtype)
         noise = noise.unsqueeze(0).expand(x.shape[0], -1)              # [chunk, P]
         latent, _, _ = vision_model.forward_encoder(x, mask_ratio=0.0, noise=noise)
-        outs.append(latent[:, 0, :])                                   # CLS token [chunk, D]
+        if pool == 'mean':
+            outs.append(latent[:, 1:, :].mean(dim=1))                  # patch-mean [chunk, D]
+        else:
+            outs.append(latent[:, 0, :])                               # CLS token  [chunk, D]
     return torch.cat(outs, dim=0)
 
 
@@ -185,6 +192,10 @@ def main():
                         help='Path to visiontspp_*.ckpt. If omitted, auto-downloaded from HuggingFace.')
     parser.add_argument('--ckpt_dir', type=str, default='./hf_models/VisionTSpp',
                         help='Dir to download/find VisionTS++ weights when --ckpt_path is not given.')
+    parser.add_argument('--pool', type=str, default='cls', choices=['cls', 'mean'],
+                        help="Teacher vector: 'cls' token (default) or 'mean' of patch tokens. "
+                             "Each writes a SEPARATE cache (method tag VisionTSpp vs "
+                             "VisionTSpp_meanpool), so both can coexist.")
     parser.add_argument('--periodicity', type=int, default=0, help='0 = dataset default from config')
     parser.add_argument('--norm_const', type=float, default=0.4)
     parser.add_argument('--clip_val', type=float, default=5.0)
@@ -202,7 +213,10 @@ def main():
     cfg = DATASET_CONFIGS[cli_args.dataset]
     periodicity = cli_args.periodicity if cli_args.periodicity > 0 else cfg['periodicity']
 
-    cache_dir = f"{cfg['cache_base']}_VisionTSpp_pervar"
+    # Method tag -> cache dir. 'cls' keeps the original name (VisionTSpp) so
+    # existing caches/runs are unaffected; 'mean' uses VisionTSpp_meanpool.
+    method_tag = 'VisionTSpp' if cli_args.pool == 'cls' else 'VisionTSpp_meanpool'
+    cache_dir = f"{cfg['cache_base']}_{method_tag}_pervar"
     os.makedirs(cache_dir, exist_ok=True)
 
     data_args = argparse.Namespace(
@@ -215,6 +229,7 @@ def main():
 
     print(f"Dataset:     {cli_args.dataset}")
     print(f"Arch:        {cli_args.arch}  (teacher dim = {ARCH_DIM[cli_args.arch]})")
+    print(f"Pool:        {cli_args.pool}  (method tag = {method_tag})")
     print(f"Periodicity: {periodicity}")
     print(f"Image size:  {cli_args.image_size}")
     print(f"Device:      {DEVICE}")
@@ -249,7 +264,8 @@ def main():
                     sample.unsqueeze(0), periodicity=periodicity,
                     image_size=cli_args.image_size, norm_const=cli_args.norm_const,
                     clip_val=cli_args.clip_val, device=DEVICE)        # [N, 3, H, W]
-                embedding = encode_cls(vision_model, images, chunk=cli_args.enc_chunk)  # [N, D]
+                embedding = encode_images(vision_model, images, pool=cli_args.pool,
+                                          chunk=cli_args.enc_chunk)                  # [N, D]
 
                 np.save(cache_path, embedding.cpu().numpy())
                 existing.add(ts_hash)
