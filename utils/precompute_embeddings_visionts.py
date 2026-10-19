@@ -1,169 +1,291 @@
-#!/bin/bash
-# ═══════════════════════════════════════════════════════════════════════════
-# JEPAVTS + TimeMixer student, VisionTS++ teacher (instead of DINO).
-# Same configs as JEPAVTS_TimeMixer_all_datasets.sh — ONLY the teacher changes
-# (RENDER=VisionTSpp). SINGLE-encoder only (one job per dataset+horizon).
-#
-# PREREQUISITE — precompute the VisionTS++ per-variable teacher embeddings first:
-#
-#   pip install git+https://github.com/Keytoyze/VisionTS.git   # once
-#   python utils/precompute_embeddings_visionts.py --dataset ETTh1
-#   # (one run per dataset covers all horizons; see the script's header)
-#
-# The teacher loads embeddings from:
-#   {root_path}/visionts_embeddings_{data}_VisionTSpp_pervar
-# (produced by precompute_embeddings_visionts.py). teacher_dim = 768 (mae_base),
-# so nothing else in the pipeline changes vs the DINO runs.
-# ═══════════════════════════════════════════════════════════════════════════
+"""
+Precompute per-variable VisionTS++ teacher embeddings for JEPA4TS.
 
-# Multi-GPU: each experiment runs on ONE gpu; different experiments run in
-# parallel across these gpus (one experiment per gpu at a time). Override via env:
-#   GPUS="0 1 2 3" bash scripts/long_term_forecast/JEPAVTS_TimeMixer_visionts.sh
-GPUS="${GPUS:-0 1 2 3}"
+This is the VisionTS++ analogue of utils/precompute_embeddings_pervar.py.
+Instead of RP/GAF/LinePlot/Spectrogram + DINOv2, it renders each series the
+*VisionTS++ way* and runs the VisionTS++ MAE encoder as the teacher:
 
-# Datasets to run (override for a quick single-dataset test):
-#   DATASETS="ETTh1" bash scripts/long_term_forecast/JEPAVTS_TimeMixer_visionts.sh
-DATASETS="${DATASETS:-ETTh1 ETTh2 ETTm1 ETTm2 weather electricity traffic exchange_rate}"
+    1. Per-series instance norm   (mean subtract, std / norm_const, norm_const=0.4)
+    2. Reshape the 1-D window into a 2-D periodicity grid:
+           n (p f) -> n f p        (f = periodicity, e.g. 24 for hourly ETTh1)
+    3. Resize the grid to the MAE image size (224x224) and clip
+    4. Replicate to 3 channels (channel-independent, one image per variable)
+    5. Run the VisionTS++ MAE *encoder* at mask_ratio=0 (full render, no
+       forecast mask) and take the CLS token -> [768] per variable
 
-# Per-job logs + resume markers (a finished job is skipped on re-run).
-LOG_DIR="${LOG_DIR:-logs/jepavts_timemixer_visionts}"
+Each sample is cached individually by the md5 hash of its [seq_len, N] float32
+array -- the SAME hashing scheme as the DINO teacher -- so the result is a
+drop-in replacement for the per-variable DINO cache: [N, 768] per sample.
 
-MODEL=JEPAVTS
-STUDENT=TimeMixer
-# Teacher cache tag (must be precomputed). Override via env, e.g.:
-#   RENDER=VisionTSpp_meanpool bash scripts/long_term_forecast/JEPAVTS_TimeMixer_visionts.sh
-RENDER="${RENDER:-VisionTSpp}"   # VisionTSpp (CLS) | VisionTSpp_meanpool
-JEPA_WEIGHT="${JEPA_WEIGHT:-1}"
-JEPA_SCALE="${JEPA_SCALE:-coarse}"   # timemixer_jepa_scale: fine | coarse
-JEPA_LOSS="${JEPA_LOSS:-mse}"        # JEPA alignment loss: mse | cosine
+Output cache dir:
+    {root}/visionts_embeddings_{dataset}_VisionTSpp_pervar/{hash}.npy   # [N, 768]
 
-# Shared training hyper-params
-DS_WINDOW=2
+Setup (Colab / GPU box):
+    pip install git+https://github.com/Keytoyze/VisionTS.git   # provides `visionts.VisionTSpp`
+    # weights auto-download from HuggingFace (Lefei/VisionTSpp) on first run,
+    # or pass --ckpt_path to a pre-downloaded visiontspp_base.ckpt
 
-# Per-dataset config (identical to JEPAVTS_TimeMixer_all_datasets.sh).
-# Field order:
-#   data|root_path|data_path|enc_in|e_layers|d_model|d_ff|batch_size|ds_layers|lr|epochs|patience|dropout|seq_len|horizons
-get_cfg() {
-  case "$1" in
-    ETTh1)            echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7|2|16|32|128|3|0.01|10|3|0.6|96|96 192 336 720" ;;
-    ETTh2)            echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7|2|16|32|128|3|0.01|10|3|0.6|96|96 192 336 720" ;;
-    ETTm1)            echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7|2|16|32|128|3|0.01|10|3|0.1|96|96 192 336 720" ;;
-    ETTm2)            echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7|2|32|64|128|3|0.01|10|3|0.1|96|96 192 336 720" ;;
-    weather)          echo "custom|./dataset/weather/|weather.csv|21|2|16|32|128|3|0.01|20|10|0.1|96|96 192 336 720" ;;
-    electricity)      echo "custom|./dataset/electricity/|electricity.csv|321|2|16|32|32|3|0.01|20|10|0.1|96|96 192 336 720" ;;
-    traffic)          echo "custom|./dataset/traffic/|traffic.csv|862|2|32|64|8|3|0.01|20|3|0.1|96|96 192 336 720" ;;
-    exchange_rate)    echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|2|16|32|32|3|0.01|10|3|0.1|96|96 192 336 720" ;;
-    *) echo "UNKNOWN dataset: $1" >&2; return 1 ;;
-  esac
+Usage:
+    python utils/precompute_embeddings_visionts.py --dataset ETTh1
+    python utils/precompute_embeddings_visionts.py --dataset ETTh1 --arch mae_base --periodicity 24
+    python utils/precompute_embeddings_visionts.py --dataset ETTh1 --zip   # zip when done (Colab)
+"""
+
+import os
+import argparse
+import hashlib
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import einops
+from tqdm import tqdm
+import shutil
+
+# Ensure project root is importable when run as `python utils/...`
+project_root = str(Path(__file__).resolve().parents[1])
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# ============================================
+# DATASET CONFIGS  (mirrors precompute_embeddings_pervar.py)
+# `periodicity` is the VisionTS++ seasonality used to build the 2-D grid.
+# ============================================
+DATASET_CONFIGS = {
+    'ETTh1': {'data': 'ETTh1', 'root_path': './dataset/ETT-small/', 'data_path': 'ETTh1.csv',
+              'cache_base': './dataset/ETT-small/visionts_embeddings_ETTh1',
+              'freq': 'h', 'features': 'M', 'target': 'OT', 'periodicity': 24},
+    'ETTh2': {'data': 'ETTh2', 'root_path': './dataset/ETT-small/', 'data_path': 'ETTh2.csv',
+              'cache_base': './dataset/ETT-small/visionts_embeddings_ETTh2',
+              'freq': 'h', 'features': 'M', 'target': 'OT', 'periodicity': 24},
+    'ETTm1': {'data': 'ETTm1', 'root_path': './dataset/ETT-small/', 'data_path': 'ETTm1.csv',
+              'cache_base': './dataset/ETT-small/visionts_embeddings_ETTm1',
+              'freq': 't', 'features': 'M', 'target': 'OT', 'periodicity': 96},
+    'ETTm2': {'data': 'ETTm2', 'root_path': './dataset/ETT-small/', 'data_path': 'ETTm2.csv',
+              'cache_base': './dataset/ETT-small/visionts_embeddings_ETTm2',
+              'freq': 't', 'features': 'M', 'target': 'OT', 'periodicity': 96},
+    'weather': {'data': 'custom', 'root_path': './dataset/weather/', 'data_path': 'weather.csv',
+                'cache_base': './dataset/weather/visionts_embeddings_weather',
+                'freq': 'h', 'features': 'M', 'target': 'OT', 'periodicity': 24},
+    'electricity': {'data': 'custom', 'root_path': './dataset/electricity/', 'data_path': 'electricity.csv',
+                    'cache_base': './dataset/electricity/visionts_embeddings_electricity',
+                    'freq': 'h', 'features': 'M', 'target': 'OT', 'periodicity': 24},
+    'traffic': {'data': 'custom', 'root_path': './dataset/traffic/', 'data_path': 'traffic.csv',
+                'cache_base': './dataset/traffic/visionts_embeddings_traffic',
+                'freq': 'h', 'features': 'M', 'target': 'OT', 'periodicity': 24},
+    'exchange_rate': {'data': 'custom', 'root_path': './dataset/exchange_rate/', 'data_path': 'exchange_rate.csv',
+                      'cache_base': './dataset/exchange_rate/visionts_embeddings_exchange_rate',
+                      'freq': 'd', 'features': 'M', 'target': 'OT', 'periodicity': 7},
+    'national_illness': {'data': 'custom', 'root_path': './dataset/', 'data_path': 'national_illness.csv',
+                         'cache_base': './dataset/visionts_embeddings_national_illness',
+                         'freq': 'w', 'features': 'M', 'target': 'OT', 'periodicity': 52},
 }
 
-run_one() {
-  # args: dataset_name pred_len enc_setting(single|dual) gpu_id
-  local name=$1 pred_len=$2 enc=$3 gpu=$4
-  IFS='|' read -r data root_path data_path enc_in e_layers d_model d_ff batch_size ds_layers lr epochs patience dropout seq_len horizons <<< "$(get_cfg "$name")"
+# MAE backbone -> embedding dim produced by the CLS token
+ARCH_DIM = {'mae_base': 768, 'mae_large': 1024, 'mae_huge': 1280}
 
-  local extra=""
-  local tag="single"
-  if [ "$enc" = "dual" ]; then
-    extra="--use_dual_encoder --fusion_type mlp"
-    tag="dual"
-  fi
+DEVICE = "cuda" if torch.cuda.is_available() else (
+    "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
 
-  local model_id="${name}_${RENDER}_${seq_len}_${pred_len}_${tag}"
-  local logf="$LOG_DIR/${model_id}.log"
-  local donef="$LOG_DIR/${model_id}.done"
 
-  if [ -f "$donef" ]; then
-    echo "[gpu $gpu] SKIP (already done): $model_id"
-    return 0
-  fi
+# ============================================
+# VisionTS++ per-variable rendering
+# ============================================
+def render_visionts_pervar(x, periodicity, image_size=224, norm_const=0.4,
+                           clip_val=5.0, device=None):
+    """Render a single sample into one VisionTS++ image per variable.
 
-  echo "[gpu $gpu] START: $model_id"
-  CUDA_VISIBLE_DEVICES=$gpu python -u run.py \
-    --task_name long_term_forecast \
-    --is_training 1 \
-    --root_path "$root_path" \
-    --data_path "$data_path" \
-    --model_id "$model_id" \
-    --model $MODEL \
-    --student_model $STUDENT \
-    --data "$data" \
-    --features M \
-    --seq_len "$seq_len" \
-    --label_len 0 \
-    --pred_len "$pred_len" \
-    --e_layers "$e_layers" \
-    --enc_in "$enc_in" \
-    --c_out "$enc_in" \
-    --des Exp \
-    --itr 1 \
-    --d_model "$d_model" \
-    --d_ff "$d_ff" \
-    --learning_rate "$lr" \
-    --train_epochs "$epochs" \
-    --patience "$patience" \
-    --batch_size "$batch_size" \
-    --dropout "$dropout" \
-    --down_sampling_layers "$ds_layers" \
-    --down_sampling_method avg \
-    --down_sampling_window $DS_WINDOW \
-    --timemixer_jepa_scale $JEPA_SCALE \
-    --per_var_teacher \
-    --rendering_methods $RENDER \
-    --jepa_weight $JEPA_WEIGHT \
-    --jepa_loss_type $JEPA_LOSS \
-    $extra \
-    > "$logf" 2>&1
-  local rc=$?
-  if [ $rc -eq 0 ]; then
-    touch "$donef"
-    echo "[gpu $gpu] DONE:  $model_id"
-  else
-    echo "[gpu $gpu] FAIL (rc=$rc): $model_id  ->  see $logf"
-  fi
-  return $rc
-}
+    x: [1, seq_len, N]  ->  returns [N, 3, image_size, image_size]
 
-# Worker: process a queue of jobs sequentially on a single gpu.
-worker() {
-  local gpu=$1; shift
-  for job in "$@"; do
-    IFS=':' read -r name pred_len enc <<< "$job"
-    run_one "$name" "$pred_len" "$enc" "$gpu"
-  done
-}
+    Mirrors VisionTSpp's pipeline (normalize -> periodicity segmentation ->
+    resize -> 3 channels -> clip), but in channel-independent "full render"
+    mode: the whole look-back fills the image, no forecast mask band.
+    """
+    if device is None:
+        device = x.device
+    _, seq_len, nvars = x.shape
 
-mkdir -p "$LOG_DIR"
+    # 1. Per-series instance normalization (VisionTS++: std / norm_const)
+    means = x.mean(1, keepdim=True).detach()              # [1, 1, N]
+    x_enc = x - means
+    stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+    stdev = stdev / norm_const
+    x_enc = x_enc / stdev
+    x_enc = einops.rearrange(x_enc, 'b s n -> (b n) s')   # [N, seq_len]
 
-# Build the full job list (each entry: name:pred_len:enc).
-job_list=""
-for name in $DATASETS; do
-  cfg="$(get_cfg "$name")" || exit 1
-  horizons="$(printf '%s' "$cfg" | awk -F'|' '{print $NF}')"
-  for pred_len in $horizons; do
-    job_list="$job_list ${name}:${pred_len}:single"
-  done
-done
+    # 2. Pad on the left so the length divides the periodicity, then segment.
+    #    'replicate' matches VisionTS's default padding_mode.
+    pad_left = (periodicity - seq_len % periodicity) % periodicity
+    if pad_left > 0:
+        x_enc = F.pad(x_enc.unsqueeze(1), (pad_left, 0), mode='replicate').squeeze(1)
+    x_2d = einops.rearrange(x_enc, 'n (p f) -> n 1 f p', f=periodicity)  # [N, 1, f, p]
 
-gpu_arr=($GPUS)
-job_arr=($job_list)
-ngpu=${#gpu_arr[@]}
-echo "Dispatching ${#job_arr[@]} experiments across $ngpu gpu(s): $GPUS"
-echo "Logs: $LOG_DIR/<model_id>.log"
+    # 3. Resize the periodicity grid to the full MAE image (no mask band).
+    x_img = F.interpolate(x_2d, size=(image_size, image_size),
+                          mode='bilinear', align_corners=False)          # [N, 1, H, W]
 
-# Distribute jobs round-robin, then launch one background worker per gpu.
-for idx in "${!gpu_arr[@]}"; do
-  gpu="${gpu_arr[$idx]}"
-  sel=""
-  j=$idx
-  while [ $j -lt ${#job_arr[@]} ]; do
-    sel="$sel ${job_arr[$j]}"
-    j=$((j + ngpu))
-  done
-  nsel=$(printf '%s\n' $sel | grep -c . || true)
-  echo "  gpu $gpu  <-  $nsel experiments"
-  worker "$gpu" $sel &
-done
+    # 4. Channel-independent: replicate the single grey image to 3 channels.
+    x_img = x_img.expand(-1, 3, -1, -1).contiguous()                     # [N, 3, H, W]
 
-wait
-echo "All gpus finished. Collect results with: python utils/collect_results.py"
+    # 5. Clip (VisionTS++ default, clip_input=0 path -> clip to [-5, 5]).
+    x_img = torch.clip(x_img, -clip_val, clip_val)
+    return x_img.to(device)
+
+
+def load_visionts_encoder(arch, ckpt_path, ckpt_dir, device):
+    """Load VisionTS++ weights and return the frozen MAE vision_model (encoder)."""
+    from visionts import VisionTSpp
+    kwargs = dict(arch=arch, finetune_type='none', quantile=True,
+                  clip_input=0, complete_no_clip=False, color=True)
+    if ckpt_path:
+        model = VisionTSpp(ckpt_path=ckpt_path, load_ckpt=True, **kwargs)
+    else:
+        # Weights auto-download from HuggingFace (Lefei/VisionTSpp) into ckpt_dir
+        default_ckpt = os.path.join(ckpt_dir, f"visiontspp_{arch.split('_')[1]}.ckpt")
+        model = VisionTSpp(ckpt_path=default_ckpt, load_ckpt=True, **kwargs)
+    vision_model = model.vision_model.to(device).eval()
+    for p in vision_model.parameters():
+        p.requires_grad = False
+    return vision_model
+
+
+@torch.no_grad()
+def encode_images(vision_model, images, pool='cls', chunk=16):
+    """images: [N, 3, H, W] -> teacher embeddings [N, D] at mask_ratio=0.
+
+    pool:
+      'cls'  -> the CLS token               latent[:, 0, :]
+      'mean' -> mean over the patch tokens  latent[:, 1:, :].mean(1)
+
+    Passes deterministic ascending `noise` so random_masking keeps all patches
+    in natural order (mask_ratio=0 keeps everything; this makes the embeddings
+    fully reproducible).
+    """
+    n_patches = vision_model.patch_embed.num_patches
+    outs = []
+    for start in range(0, images.shape[0], chunk):
+        x = images[start:start + chunk]
+        noise = torch.arange(n_patches, device=x.device, dtype=x.dtype)
+        noise = noise.unsqueeze(0).expand(x.shape[0], -1)              # [chunk, P]
+        latent, _, _ = vision_model.forward_encoder(x, mask_ratio=0.0, noise=noise)
+        if pool == 'mean':
+            outs.append(latent[:, 1:, :].mean(dim=1))                  # patch-mean [chunk, D]
+        else:
+            outs.append(latent[:, 0, :])                               # CLS token  [chunk, D]
+    return torch.cat(outs, dim=0)
+
+
+def get_ts_hash(ts_array):
+    """md5 of the [seq_len, N] float32 sample -- identical to the DINO teacher."""
+    return hashlib.md5(ts_array.astype(np.float32).tobytes()).hexdigest()[:16]
+
+
+def main():
+    from data_provider.data_factory import data_provider
+
+    parser = argparse.ArgumentParser(description="Precompute per-variable VisionTS++ teacher embeddings")
+    parser.add_argument('--dataset', type=str, required=True, choices=list(DATASET_CONFIGS.keys()))
+    parser.add_argument('--arch', type=str, default='mae_base', choices=list(ARCH_DIM.keys()))
+    parser.add_argument('--ckpt_path', type=str, default=None,
+                        help='Path to visiontspp_*.ckpt. If omitted, auto-downloaded from HuggingFace.')
+    parser.add_argument('--ckpt_dir', type=str, default='./hf_models/VisionTSpp',
+                        help='Dir to download/find VisionTS++ weights when --ckpt_path is not given.')
+    parser.add_argument('--pool', type=str, default='cls', choices=['cls', 'mean'],
+                        help="Teacher vector: 'cls' token (default) or 'mean' of patch tokens. "
+                             "Each writes a SEPARATE cache (method tag VisionTSpp vs "
+                             "VisionTSpp_meanpool), so both can coexist.")
+    parser.add_argument('--periodicity', type=int, default=0, help='0 = dataset default from config')
+    parser.add_argument('--norm_const', type=float, default=0.4)
+    parser.add_argument('--clip_val', type=float, default=5.0)
+    parser.add_argument('--image_size', type=int, default=224)
+    parser.add_argument('--seq_len', type=int, default=96)
+    parser.add_argument('--label_len', type=int, default=48)
+    parser.add_argument('--pred_len', type=int, default=96)
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Keep at 1 for hash-based caching (one sample at a time).')
+    parser.add_argument('--enc_chunk', type=int, default=16,
+                        help='Max variable-images fed to the encoder at once (GPU memory).')
+    parser.add_argument('--zip', action='store_true', help='Zip cache dir when done (Colab).')
+    cli_args = parser.parse_args()
+
+    cfg = DATASET_CONFIGS[cli_args.dataset]
+    periodicity = cli_args.periodicity if cli_args.periodicity > 0 else cfg['periodicity']
+
+    # Method tag -> cache dir. 'cls' keeps the original name (VisionTSpp) so
+    # existing caches/runs are unaffected; 'mean' uses VisionTSpp_meanpool.
+    method_tag = 'VisionTSpp' if cli_args.pool == 'cls' else 'VisionTSpp_meanpool'
+    cache_dir = f"{cfg['cache_base']}_{method_tag}_pervar"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    data_args = argparse.Namespace(
+        data=cfg['data'], root_path=cfg['root_path'], data_path=cfg['data_path'],
+        features=cfg['features'], target=cfg['target'],
+        seq_len=cli_args.seq_len, label_len=cli_args.label_len, pred_len=cli_args.pred_len,
+        embed='timeF', freq=cfg['freq'], batch_size=cli_args.batch_size, num_workers=0,
+        seasonal_patterns='Monthly', augmentation_ratio=0, task_name='long_term_forecast',
+    )
+
+    print(f"Dataset:     {cli_args.dataset}")
+    print(f"Arch:        {cli_args.arch}  (teacher dim = {ARCH_DIM[cli_args.arch]})")
+    print(f"Pool:        {cli_args.pool}  (method tag = {method_tag})")
+    print(f"Periodicity: {periodicity}")
+    print(f"Image size:  {cli_args.image_size}")
+    print(f"Device:      {DEVICE}")
+    print(f"Cache dir:   {cache_dir}")
+
+    print("\nLoading VisionTS++ encoder...")
+    vision_model = load_visionts_encoder(cli_args.arch, cli_args.ckpt_path,
+                                         cli_args.ckpt_dir, DEVICE)
+
+    existing = set(f[:-4] for f in os.listdir(cache_dir) if f.endswith('.npy'))
+    print(f"Existing cached: {len(existing)}")
+
+    for flag in ['train', 'val', 'test']:
+        print(f"\n{'='*50}\nProcessing {flag.upper()} split...\n{'='*50}")
+        _, data_loader = data_provider(data_args, flag)
+        generated, skipped = 0, 0
+
+        for batch_x, batch_y, batch_x_mark, batch_y_mark in tqdm(data_loader):
+            batch_x = batch_x.float().to(DEVICE)   # [B, seq_len, N]
+            for b in range(batch_x.shape[0]):
+                sample = batch_x[b]                # [seq_len, N]
+                sample_np = sample.cpu().numpy().astype(np.float32)
+                ts_hash = get_ts_hash(sample_np)
+
+                cache_path = os.path.join(cache_dir, f"{ts_hash}.npy")
+                if ts_hash in existing or os.path.exists(cache_path):
+                    existing.add(ts_hash)
+                    skipped += 1
+                    continue
+
+                images = render_visionts_pervar(
+                    sample.unsqueeze(0), periodicity=periodicity,
+                    image_size=cli_args.image_size, norm_const=cli_args.norm_const,
+                    clip_val=cli_args.clip_val, device=DEVICE)        # [N, 3, H, W]
+                embedding = encode_images(vision_model, images, pool=cli_args.pool,
+                                          chunk=cli_args.enc_chunk)                  # [N, D]
+
+                np.save(cache_path, embedding.cpu().numpy())
+                existing.add(ts_hash)
+                generated += 1
+
+        print(f"  Generated: {generated}, Skipped: {skipped}")
+
+    total = len([f for f in os.listdir(cache_dir) if f.endswith('.npy')])
+    print(f"\nDone! Total embeddings: {total}  ->  {cache_dir}")
+
+    if cli_args.zip:
+        zip_path = shutil.make_archive(cache_dir, 'zip', cache_dir)
+        print(f"Zipped to: {zip_path}")
+        try:
+            from google.colab import files
+            files.download(zip_path)
+            print("Download triggered!")
+        except ImportError:
+            print("Not in Colab, zip saved locally.")
+
+
+if __name__ == '__main__':
+    main()
