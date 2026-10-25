@@ -20,6 +20,44 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
 
+        # Optional: VisionTS++ prediction (forecast) regularizer.
+        #   L = MSE(student, y_true) + weight * MSE(student, visionts++_forecast)
+        # The VisionTS++ forecast is frozen (no grad), computed on-the-fly from the
+        # SAME look-back window the student sees, in colorized-multivariate (MV) mode.
+        # Off by default -> plain training is unchanged unless --vts_pred_reg is set.
+        self.vts_reg = getattr(args, 'vts_pred_reg', False)
+        if self.vts_reg:
+            from visionts import VisionTSpp
+            arch = getattr(args, 'vts_pred_arch', 'mae_base')
+            ckpt_dir = getattr(args, 'vts_pred_ckpt_dir', './hf_models/VisionTSpp')
+            ckpt_path = os.path.join(ckpt_dir, f"visiontspp_{arch.split('_')[1]}.ckpt")
+            self.vts_teacher = VisionTSpp(
+                arch=arch, finetune_type='none', ckpt_path=ckpt_path, load_ckpt=True,
+                quantile=True, clip_input=0, complete_no_clip=False, color=True,
+            ).to(self.device).eval()
+            for p in self.vts_teacher.parameters():
+                p.requires_grad = False
+            self.vts_P = getattr(args, 'vts_pred_periodicity', 24)
+            self.vts_teacher.update_config(
+                context_len=args.seq_len, pred_len=args.pred_len,
+                periodicity=self.vts_P, norm_const=0.4, align_const=0.4)
+            self.vts_reg_weight = getattr(args, 'vts_pred_reg_weight', 1.0)
+            print(f"[VTS pred-reg] weight={self.vts_reg_weight}, periodicity={self.vts_P}, "
+                  f"color=True (MV), context={args.seq_len}")
+
+    def _vts_forecast(self, batch_x, f_dim):
+        """Frozen VisionTS++ MV forecast for the student's input window.
+
+        batch_x: [B, seq_len, N] (scaled, on device) -> [B, pred_len, N'] detached.
+        Forced to fp32 (autocast disabled) for a stable teacher target.
+        """
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+            y = self.vts_teacher.forward(batch_x.float())
+            if isinstance(y, (list, tuple)):
+                y = y[0]                              # quantile median
+            y = y[:, -self.args.pred_len:, f_dim:]
+        return y.detach()
+
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
 
@@ -126,6 +164,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
+                        if self.vts_reg:
+                            vts_pred = self._vts_forecast(batch_x, f_dim)
+                            loss = loss + self.vts_reg_weight * criterion(outputs, vts_pred)
                         train_loss.append(loss.item())
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
@@ -134,6 +175,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
+                    if self.vts_reg:
+                        vts_pred = self._vts_forecast(batch_x, f_dim)
+                        loss = loss + self.vts_reg_weight * criterion(outputs, vts_pred)
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
