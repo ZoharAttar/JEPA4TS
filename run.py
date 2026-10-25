@@ -249,6 +249,20 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=0.5, help='Dynamic Routing in MoE')
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
+    # VisionTS++ prediction regularizer (output-space distillation for a plain
+    # student like PatchTST): L = MSE(student, y_true) + w * MSE(student, vts++ forecast).
+    # Frozen VisionTS++, colorized-multivariate (MV), same look-back as the student.
+    parser.add_argument('--vts_pred_reg', action='store_true',
+                        help='Add VisionTS++ forecast as an MSE regularizer (output distillation)')
+    parser.add_argument('--vts_pred_reg_weight', type=float, default=1.0,
+                        help='Weight on the VisionTS++ prediction-regularizer MSE term')
+    parser.add_argument('--vts_pred_periodicity', type=int, default=24,
+                        help='Periodicity for VisionTS++ image rendering (ETT hourly=24)')
+    parser.add_argument('--vts_pred_arch', type=str, default='mae_base',
+                        help='VisionTS++ backbone: mae_base | mae_large | mae_huge')
+    parser.add_argument('--vts_pred_ckpt_dir', type=str, default='./hf_models/VisionTSpp',
+                        help='Dir with visiontspp_*.ckpt (auto-download if absent)')
+
     args = parser.parse_args()
 
     # Seed everything from --seed so multi-seed experiments are reproducible.
