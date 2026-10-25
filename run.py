@@ -263,6 +263,19 @@ if __name__ == '__main__':
     parser.add_argument('--vts_pred_ckpt_dir', type=str, default='./hf_models/VisionTSpp',
                         help='Dir with visiontspp_*.ckpt (auto-download if absent)')
 
+    # VTSDecoderProbe (--model VTSDecoderProbe): PatchTST encoder -> MLP -> frozen
+    # VisionTS++ pixel decoder -> forecast. Trains encoder+MLP with forecast MSE.
+    parser.add_argument('--vts_render_mode', type=str, default='ci', choices=['ci', 'mv'],
+                        help='VTSDecoderProbe rendering: ci (per-variable) | mv (colorized multivariate)')
+    parser.add_argument('--vts_arch', type=str, default='mae_base',
+                        help='VisionTS++ backbone for the frozen decoder')
+    parser.add_argument('--vts_ckpt_dir', type=str, default='./hf_models/VisionTSpp',
+                        help='Dir with visiontspp_*.ckpt for VTSDecoderProbe')
+    parser.add_argument('--vts_periodicity', type=int, default=24,
+                        help='Periodicity for VisionTS++ image rendering (ETT hourly=24, FX=1)')
+    parser.add_argument('--vts_mlp_hidden', type=int, default=2048,
+                        help='Hidden width of the MLP mapping student features -> decoder latent')
+
     args = parser.parse_args()
 
     # Seed everything from --seed so multi-seed experiments are reproducible.
