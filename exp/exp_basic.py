@@ -6,7 +6,7 @@ from models import (
     Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, 
     FiLM, iTransformer, Koopa, TiDE, FreTS, TimeMixer, TSMixer, SegRNN, MambaSimple, 
     TemporalFusionTransformer, SCINet, PAttn, TimeXer, WPMixer, MultiPatchFormer, 
-    KANAD, MSGNet, TimeFilter
+    KANAD, MSGNet, TimeFilter, VTSDecoderProbe
 )
 
 
@@ -43,7 +43,8 @@ class Exp_Basic(object):
             'MultiPatchFormer': MultiPatchFormer,
             'KANAD': KANAD,
             'MSGNet': MSGNet,
-            'TimeFilter': TimeFilter
+            'TimeFilter': TimeFilter,
+            'VTSDecoderProbe': VTSDecoderProbe
         }
 
     def __init__(self, args):
