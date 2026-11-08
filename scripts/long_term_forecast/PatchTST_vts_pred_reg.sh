@@ -9,23 +9,26 @@
 # Setup (once): pip install git+https://github.com/Keytoyze/VisionTS.git
 #
 # Env knobs:
-#   REG=1|0        1 = with VisionTS++ reg (default), 0 = plain PatchTST baseline
-#   LAMBDA=1.0     weight on the regularizer term
+#   LAMBDAS="0 0.1 0.3 0.5 1.0 2.0"  sweep of regularizer weights (0 = baseline)
 #   DATASETS="ETTh1 ETTh2 exchange_rate"
 #   GPUS="0 1 2 3"
 #   HORIZONS="96 192 336 720"
 #
+# LAMBDA=0 is the plain-PatchTST baseline (no VisionTS++ reg); any LAMBDA>0 adds
+# the regularizer at that weight. Each (dataset,horizon,lambda) is its own job
+# with its own model_id/resume marker, all fanned across GPUs.
+#
 # Usage:
-#   bash scripts/long_term_forecast/PatchTST_vts_pred_reg.sh                 # with reg, ETT
-#   REG=0 bash scripts/long_term_forecast/PatchTST_vts_pred_reg.sh           # baseline (no reg)
-#   LAMBDA=0.5 DATASETS="ETTh1 ETTh2 exchange_rate" bash scripts/long_term_forecast/PatchTST_vts_pred_reg.sh
+#   bash scripts/long_term_forecast/PatchTST_vts_pred_reg.sh                      # full sweep incl. baseline
+#   LAMBDAS="0.3" bash scripts/long_term_forecast/PatchTST_vts_pred_reg.sh        # single weight
+#   LAMBDAS="0 1.0" DATASETS="ETTh1 ETTh2 exchange_rate" bash scripts/long_term_forecast/PatchTST_vts_pred_reg.sh
 # ═══════════════════════════════════════════════════════════════════════════
 
 GPUS="${GPUS:-0 1 2 3}"
 DATASETS="${DATASETS:-ETTh1 ETTh2}"
 HORIZONS="${HORIZONS:-96 192 336 720}"
-REG="${REG:-1}"
-LAMBDA="${LAMBDA:-1.0}"
+LAMBDAS="${LAMBDAS:-0 0.1 0.3 0.5 1.0 2.0}"   # 0 = baseline; rest = reg weights
+VTS_RENDER="${VTS_RENDER:-mv}"                # teacher forecast rendering: mv | ci
 CKPT_DIR="${CKPT_DIR:-./hf_models/VisionTSpp}"
 LOG_DIR="${LOG_DIR:-logs/patchtst_vts_pred_reg}"
 mkdir -p "$LOG_DIR"
@@ -71,14 +74,17 @@ get_cfg() {
 }
 
 run_one() {
-  local name=$1 pred_len=$2 gpu=$3
+  local name=$1 pred_len=$2 lam=$3 gpu=$4
   IFS='|' read -r data root_path data_path enc_in e_layers d_model d_ff n_heads factor batch_size lr epochs patience dropout seq_len <<< "$(get_cfg "$name" "$pred_len")" || return 1
   local P; P=$(get_P "$name")
 
+  # lam == 0 -> plain baseline (no VisionTS++ reg); lam > 0 -> reg at that weight.
+  # MV keeps the original tag (vtsreg{lam}); CI is tagged vtsregci{lam} so the two
+  # renderings don't collide in result/model ids.
   local reg_args="" tag="base"
-  if [ "$REG" = "1" ]; then
-    reg_args="--vts_pred_reg --vts_pred_reg_weight $LAMBDA --vts_pred_periodicity $P --vts_pred_ckpt_dir $CKPT_DIR"
-    tag="vtsreg${LAMBDA}"
+  if [ "$lam" != "0" ]; then
+    reg_args="--vts_pred_reg --vts_pred_reg_weight $lam --vts_pred_periodicity $P --vts_pred_render $VTS_RENDER --vts_pred_ckpt_dir $CKPT_DIR"
+    if [ "$VTS_RENDER" = "ci" ]; then tag="vtsregci${lam}"; else tag="vtsreg${lam}"; fi
   fi
 
   local model_id="${name}_PatchTST_${tag}_${seq_len}_${pred_len}"
@@ -86,7 +92,7 @@ run_one() {
   local donef="$LOG_DIR/${model_id}.done"
   if [ -f "$donef" ]; then echo "[gpu $gpu] SKIP: $model_id"; return 0; fi
 
-  echo "[gpu $gpu] START: $model_id  (el$e_layers nh$n_heads b$batch_size P$P reg=$REG)"
+  echo "[gpu $gpu] START: $model_id  (el$e_layers nh$n_heads b$batch_size P$P lam=$lam)"
   CUDA_VISIBLE_DEVICES=$gpu python -u run.py \
     --task_name long_term_forecast \
     --is_training 1 \
@@ -125,20 +131,22 @@ run_one() {
 worker() {
   local gpu=$1; shift
   for job in "$@"; do
-    IFS=':' read -r name pred_len <<< "$job"
-    run_one "$name" "$pred_len" "$gpu"
+    IFS=':' read -r name pred_len lam <<< "$job"
+    run_one "$name" "$pred_len" "$lam" "$gpu"
   done
 }
 
 job_list=""
 for name in $DATASETS; do
   for pred_len in $HORIZONS; do
-    job_list="$job_list ${name}:${pred_len}"
+    for lam in $LAMBDAS; do
+      job_list="$job_list ${name}:${pred_len}:${lam}"
+    done
   done
 done
 
 gpu_arr=($GPUS); job_arr=($job_list); ngpu=${#gpu_arr[@]}
-echo "PatchTST + VisionTS++ pred-reg (REG=$REG LAMBDA=$LAMBDA)   Datasets: $DATASETS"
+echo "PatchTST + VisionTS++ pred-reg   LAMBDAS='$LAMBDAS'   Datasets: $DATASETS"
 echo "Dispatching ${#job_arr[@]} jobs across $ngpu gpu(s): $GPUS ; logs -> $LOG_DIR/"
 
 for idx in "${!gpu_arr[@]}"; do
