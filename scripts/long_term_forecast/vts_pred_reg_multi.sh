@@ -22,6 +22,7 @@ DATASETS="${DATASETS:-ETTh1 ETTh2 exchange_rate}"
 HORIZONS="${HORIZONS:-96 192 336 720}"
 LAMBDAS="${LAMBDAS:-0 1.0}"          # 0 = baseline; 1.0 = MV reg (best from the sweep)
 VTS_RENDER="${VTS_RENDER:-mv}"       # mv | ci
+SOURCE="${SOURCE:-visionts}"         # reg teacher: visionts | timesfm (non-vision ablation)
 # Student channel-handling variants:
 TIMEMIXER_CI="${TIMEMIXER_CI:-1}"        # TimeMixer: 1 = channel-independent (default), 0 = channel-mixing
 DLINEAR_INDIVIDUAL="${DLINEAR_INDIVIDUAL:-0}"  # DLinear: 0 = shared weights (default), 1 = per-channel weights
@@ -95,8 +96,10 @@ run_one() {
 
   local reg_args="" tag="base"
   if [ "$lam" != "0" ]; then
-    reg_args="--vts_pred_reg --vts_pred_reg_weight $lam --vts_pred_periodicity $P --vts_pred_render $VTS_RENDER --vts_pred_ckpt_dir $CKPT_DIR"
-    if [ "$VTS_RENDER" = "ci" ]; then tag="vtsregci${lam}"; else tag="vtsreg${lam}"; fi
+    reg_args="--vts_pred_reg --vts_pred_reg_weight $lam --vts_pred_source $SOURCE --vts_pred_periodicity $P --vts_pred_render $VTS_RENDER --vts_pred_ckpt_dir $CKPT_DIR"
+    if [ "$SOURCE" = "timesfm" ]; then tag="tfmreg${lam}"
+    elif [ "$VTS_RENDER" = "ci" ]; then tag="vtsregci${lam}"
+    else tag="vtsreg${lam}"; fi
   fi
 
   # Variant suffix so channel-mixing / per-channel runs get distinct model_ids.
