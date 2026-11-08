@@ -26,7 +26,24 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # SAME look-back window the student sees, in colorized-multivariate (MV) mode.
         # Off by default -> plain training is unchanged unless --vts_pred_reg is set.
         self.vts_reg = getattr(args, 'vts_pred_reg', False)
-        if self.vts_reg:
+        # Teacher forecast source: 'visionts' (VisionTS++, on-the-fly) or 'timesfm'
+        # (precomputed TimesFM forecasts loaded by hash). TimesFM is the non-vision
+        # ablation: same regularizer, a TS foundation model instead of a visual one.
+        self.vts_source = getattr(args, 'vts_pred_source', 'visionts')
+        if self.vts_reg and self.vts_source == 'timesfm':
+            import os as _os
+            stem = _os.path.splitext(_os.path.basename(args.data_path))[0]
+            self.tfm_cache = _os.path.join(args.root_path,
+                                           f"timesfm_forecast_{stem}_{args.pred_len}")
+            if not _os.path.isdir(self.tfm_cache):
+                raise ValueError(f"TimesFM cache not found: {self.tfm_cache}\n"
+                                 f"   Run utils/precompute_timesfm_forecast.py --dataset {stem} "
+                                 f"--pred_len {args.pred_len} first!")
+            self.vts_reg_weight = getattr(args, 'vts_pred_reg_weight', 1.0)
+            n = len([f for f in os.listdir(self.tfm_cache) if f.endswith('.npy')])
+            print(f"[pred-reg] source=timesfm, weight={self.vts_reg_weight}, "
+                  f"cache={self.tfm_cache} ({n} forecasts)")
+        elif self.vts_reg:
             from visionts import VisionTSpp
             arch = getattr(args, 'vts_pred_arch', 'mae_base')
             ckpt_dir = getattr(args, 'vts_pred_ckpt_dir', './hf_models/VisionTSpp')
@@ -58,6 +75,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         'ci': fold vars into the batch, forecast each variable on its own image.
         Forced to fp32 (autocast disabled) for a stable teacher target.
         """
+        if self.vts_source == 'timesfm':
+            return self._timesfm_cached(batch_x, f_dim)
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
             x = batch_x.float()
             if self.vts_render == 'ci':
@@ -73,6 +92,26 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     y = y[0]                            # quantile median
             y = y[:, -self.args.pred_len:, f_dim:]
         return y.detach()
+
+    def _timesfm_cached(self, batch_x, f_dim):
+        """Load precomputed TimesFM forecast target by input-window hash.
+
+        batch_x: [B, seq_len, N] -> [B, pred_len, N'] detached. Same md5 hashing as
+        the precompute (utils/precompute_timesfm_forecast.py).
+        """
+        import hashlib
+        x = batch_x.detach().cpu().numpy().astype(np.float32)   # [B, L, N]
+        outs = []
+        for i in range(x.shape[0]):
+            h = hashlib.md5(x[i].astype(np.float32).tobytes()).hexdigest()[:16]
+            path = os.path.join(self.tfm_cache, f"{h}.npy")
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"TimesFM forecast not found: {path}\n"
+                    f"Run utils/precompute_timesfm_forecast.py for this dataset/pred_len.")
+            outs.append(torch.from_numpy(np.load(path)))        # [pred_len, N]
+        y = torch.stack(outs, dim=0).to(batch_x.device).float()  # [B, pred_len, N]
+        return y[:, -self.args.pred_len:, f_dim:].detach()
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
