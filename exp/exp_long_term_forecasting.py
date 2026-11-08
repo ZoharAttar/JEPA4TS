@@ -31,9 +31,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             arch = getattr(args, 'vts_pred_arch', 'mae_base')
             ckpt_dir = getattr(args, 'vts_pred_ckpt_dir', './hf_models/VisionTSpp')
             ckpt_path = os.path.join(ckpt_dir, f"visiontspp_{arch.split('_')[1]}.ckpt")
+            # Rendering of the teacher forecast: 'mv' = colorized multivariate
+            # (color=True, all vars in one image), 'ci' = per-variable grayscale
+            # (color=False, each variable forecast on its own image).
+            self.vts_render = getattr(args, 'vts_pred_render', 'mv')
+            color = (self.vts_render == 'mv')
             self.vts_teacher = VisionTSpp(
                 arch=arch, finetune_type='none', ckpt_path=ckpt_path, load_ckpt=True,
-                quantile=True, clip_input=0, complete_no_clip=False, color=True,
+                quantile=True, clip_input=0, complete_no_clip=False, color=color,
             ).to(self.device).eval()
             for p in self.vts_teacher.parameters():
                 p.requires_grad = False
@@ -43,18 +48,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 periodicity=self.vts_P, norm_const=0.4, align_const=0.4)
             self.vts_reg_weight = getattr(args, 'vts_pred_reg_weight', 1.0)
             print(f"[VTS pred-reg] weight={self.vts_reg_weight}, periodicity={self.vts_P}, "
-                  f"color=True (MV), context={args.seq_len}")
+                  f"render={self.vts_render} (color={color}), context={args.seq_len}")
 
     def _vts_forecast(self, batch_x, f_dim):
-        """Frozen VisionTS++ MV forecast for the student's input window.
+        """Frozen VisionTS++ forecast target for the student's input window.
 
         batch_x: [B, seq_len, N] (scaled, on device) -> [B, pred_len, N'] detached.
+        'mv': feed all vars at once (one colorized image).
+        'ci': fold vars into the batch, forecast each variable on its own image.
         Forced to fp32 (autocast disabled) for a stable teacher target.
         """
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
-            y = self.vts_teacher.forward(batch_x.float())
-            if isinstance(y, (list, tuple)):
-                y = y[0]                              # quantile median
+            x = batch_x.float()
+            if self.vts_render == 'ci':
+                B, L, N = x.shape
+                xi = x.permute(0, 2, 1).reshape(B * N, L, 1)   # [B*N, L, 1]
+                y = self.vts_teacher.forward(xi)
+                if isinstance(y, (list, tuple)):
+                    y = y[0]
+                y = y[..., 0].reshape(B, N, -1).permute(0, 2, 1)  # [B, pred_len, N]
+            else:
+                y = self.vts_teacher.forward(x)
+                if isinstance(y, (list, tuple)):
+                    y = y[0]                            # quantile median
             y = y[:, -self.args.pred_len:, f_dim:]
         return y.detach()
 
