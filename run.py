@@ -256,6 +256,8 @@ if __name__ == '__main__':
                         help='Add VisionTS++ forecast as an MSE regularizer (output distillation)')
     parser.add_argument('--vts_pred_reg_weight', type=float, default=1.0,
                         help='Weight on the VisionTS++ prediction-regularizer MSE term')
+    parser.add_argument('--vts_pred_render', type=str, default='mv', choices=['mv', 'ci'],
+                        help='Teacher forecast rendering: mv (colorized multivariate) | ci (per-variable)')
     parser.add_argument('--vts_pred_periodicity', type=int, default=24,
                         help='Periodicity for VisionTS++ image rendering (ETT hourly=24)')
     parser.add_argument('--vts_pred_arch', type=str, default='mae_base',
