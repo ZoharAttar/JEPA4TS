@@ -22,6 +22,9 @@ DATASETS="${DATASETS:-ETTh1 ETTh2 exchange_rate}"
 HORIZONS="${HORIZONS:-96 192 336 720}"
 LAMBDAS="${LAMBDAS:-0 1.0}"          # 0 = baseline; 1.0 = MV reg (best from the sweep)
 VTS_RENDER="${VTS_RENDER:-mv}"       # mv | ci
+# Student channel-handling variants:
+TIMEMIXER_CI="${TIMEMIXER_CI:-1}"        # TimeMixer: 1 = channel-independent (default), 0 = channel-mixing
+DLINEAR_INDIVIDUAL="${DLINEAR_INDIVIDUAL:-0}"  # DLinear: 0 = shared weights (default), 1 = per-channel weights
 CKPT_DIR="${CKPT_DIR:-./hf_models/VisionTSpp}"
 LOG_DIR="${LOG_DIR:-logs/vts_pred_reg_multi}"
 mkdir -p "$LOG_DIR"
@@ -67,7 +70,8 @@ model_args() {
       esac
       echo "--model PatchTST --e_layers $el --n_heads $nh --d_model 512 --d_ff 2048 --factor 3 --batch_size $bt --learning_rate 0.0001 --train_epochs $ep --patience 3 --dropout 0.1" ;;
     DLinear)
-      echo "--model DLinear --e_layers 2 --d_model 512 --batch_size 32 --learning_rate 0.005 --train_epochs 10 --patience 3 --dropout 0.1" ;;
+      local ind=""; [ "$DLINEAR_INDIVIDUAL" = "1" ] && ind="--individual"
+      echo "--model DLinear --e_layers 2 --d_model 512 --batch_size 32 --learning_rate 0.005 --train_epochs 10 --patience 3 --dropout 0.1 $ind" ;;
     TimeMixer)
       local el dm dff bt ds_l lr ep pat drop
       case "$ds" in
@@ -78,7 +82,7 @@ model_args() {
         exchange_rate) el=2; dm=16; dff=32; bt=32;  ds_l=3; lr=0.01; ep=10; pat=3;  drop=0.1 ;;
         *) echo "UNKNOWN TimeMixer $ds" >&2; return 1 ;;
       esac
-      echo "--model TimeMixer --e_layers $el --d_model $dm --d_ff $dff --batch_size $bt --down_sampling_layers $ds_l --down_sampling_method avg --down_sampling_window 2 --learning_rate $lr --train_epochs $ep --patience $pat --dropout $drop" ;;
+      echo "--model TimeMixer --e_layers $el --d_model $dm --d_ff $dff --batch_size $bt --down_sampling_layers $ds_l --down_sampling_method avg --down_sampling_window 2 --channel_independence $TIMEMIXER_CI --learning_rate $lr --train_epochs $ep --patience $pat --dropout $drop" ;;
     *) echo "UNKNOWN student $student" >&2; return 1 ;;
   esac
 }
@@ -95,7 +99,12 @@ run_one() {
     if [ "$VTS_RENDER" = "ci" ]; then tag="vtsregci${lam}"; else tag="vtsreg${lam}"; fi
   fi
 
-  local model_id="${ds}_${student}_${tag}_96_${pred}"
+  # Variant suffix so channel-mixing / per-channel runs get distinct model_ids.
+  local sfx=""
+  [ "$student" = "TimeMixer" ] && [ "$TIMEMIXER_CI" = "0" ] && sfx="cm"
+  [ "$student" = "DLinear" ] && [ "$DLINEAR_INDIVIDUAL" = "1" ] && sfx="ind"
+  local sname="$student"; [ -n "$sfx" ] && sname="${student}${sfx}"
+  local model_id="${ds}_${sname}_${tag}_96_${pred}"
   local logf="$LOG_DIR/${model_id}.log"
   local donef="$LOG_DIR/${model_id}.done"
   if [ -f "$donef" ]; then echo "[gpu $gpu] SKIP: $model_id"; return 0; fi
