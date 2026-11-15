@@ -1,161 +1,175 @@
-#!/bin/bash
-# ═══════════════════════════════════════════════════════════════════════════
-# VisionTS++ PREDICTION regularizer across multiple students and datasets.
-#   L = MSE(student, y_true) + LAMBDA * MSE(student, VisionTS++ forecast)
-# VisionTS++ frozen, MV (colorized multivariate) by default, same 96 look-back.
-# The regularizer lives in Exp_Long_Term_Forecast, so it works for ANY student.
-#
-# Students : PatchTST (per-horizon tuned) | DLinear | TimeMixer (per-dataset tuned)
-# LAMBDA=0 is the plain baseline for that student (no VisionTS++).
-#
-# Setup (once): pip install git+https://github.com/Keytoyze/VisionTS.git
-#
-# Usage:
-#   bash scripts/long_term_forecast/vts_pred_reg_multi.sh
-#   STUDENTS="DLinear TimeMixer" DATASETS="ETTh1 ETTh2 exchange_rate" \
-#     LAMBDAS="0 1.0" GPUS="0 1 2 3" bash scripts/long_term_forecast/vts_pred_reg_multi.sh
-# ═══════════════════════════════════════════════════════════════════════════
+"""
+Precompute TimesFM forecasts as a regularization target (non-vision teacher).
 
-GPUS="${GPUS:-0 1 2 3}"
-STUDENTS="${STUDENTS:-PatchTST DLinear TimeMixer}"
-DATASETS="${DATASETS:-ETTh1 ETTh2 exchange_rate}"
-HORIZONS="${HORIZONS:-96 192 336 720}"
-LAMBDAS="${LAMBDAS:-0 1.0}"          # 0 = baseline; 1.0 = MV reg (best from the sweep)
-VTS_RENDER="${VTS_RENDER:-mv}"       # mv | ci
-SOURCE="${SOURCE:-visionts}"         # reg teacher: visionts | timesfm (non-vision ablation)
-# Student channel-handling variants:
-TIMEMIXER_CI="${TIMEMIXER_CI:-1}"        # TimeMixer: 1 = channel-independent (default), 0 = channel-mixing
-DLINEAR_INDIVIDUAL="${DLINEAR_INDIVIDUAL:-0}"  # DLinear: 0 = shared weights (default), 1 = per-channel weights
-CKPT_DIR="${CKPT_DIR:-./hf_models/VisionTSpp}"
-LOG_DIR="${LOG_DIR:-logs/vts_pred_reg_multi}"
-mkdir -p "$LOG_DIR"
+This is the TimesFM counterpart to the VisionTS++ prediction regularizer. It lets
+you ablate "is the *vision* the thing that helps, or just a strong foundation-model
+forecast?" — TimesFM is a decoder-only TS foundation model with no vision at all.
 
-# VisionTS++ rendering periodicity. NB: at seq_len=96 the MV teacher is only
-# meaningful when the daily period fits in 96 -> ETTh*/exchange are fine; ETTm*
-# (P=96) and weather (P=144) are degenerate at 96 (<=1 column) and the teacher
-# target will be weak there.
-get_P() { case "$1" in
-  ETTh1|ETTh2) echo 24 ;;
-  ETTm1|ETTm2) echo 96 ;;
-  weather)     echo 144 ;;
-  exchange_rate) echo 1 ;;
-  *) echo 24 ;; esac; }
+For each input window [seq_len, N] (hashed, same md5 scheme as the other teachers),
+TimesFM forecasts each variable (univariate, channel-independent) for `pred_len`
+steps and we cache [pred_len, N]. Training then adds:
 
-# data|root_path|data_path|enc_in
-get_data() { case "$1" in
-  ETTh1) echo "ETTh1|./dataset/ETT-small/|ETTh1.csv|7" ;;
-  ETTh2) echo "ETTh2|./dataset/ETT-small/|ETTh2.csv|7" ;;
-  ETTm1) echo "ETTm1|./dataset/ETT-small/|ETTm1.csv|7" ;;
-  ETTm2) echo "ETTm2|./dataset/ETT-small/|ETTm2.csv|7" ;;
-  weather) echo "custom|./dataset/weather/|weather.csv|21" ;;
-  exchange_rate) echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8" ;;
-  *) echo "UNKNOWN $1" >&2; return 1 ;; esac; }
+    L += lambda * MSE(student_forecast, timesfm_forecast)
 
-# Student-specific run.py flags (everything except data/seq/pred/reg args).
-model_args() {
-  local student=$1 ds=$2 pred=$3
-  case "$student" in
-    PatchTST)
-      local el nh bt ep=10
-      case "${ds}_${pred}" in
-        ETTh1_96)  el=1; nh=2;  bt=32 ;;   ETTh1_192) el=1; nh=8;  bt=32 ;;
-        ETTh1_336) el=1; nh=8;  bt=32 ;;   ETTh1_720) el=1; nh=16; bt=32 ;;
-        ETTh2_*)   el=3; nh=4;  bt=32 ;;
-        ETTm1_96)  el=1; nh=2;  bt=32  ;;  ETTm1_192) el=3; nh=2;  bt=128 ;;
-        ETTm1_336) el=1; nh=4;  bt=128 ;;  ETTm1_720) el=3; nh=4;  bt=128 ;;
-        ETTm2_96)  el=3; nh=16; bt=32  ;;  ETTm2_192) el=3; nh=2;  bt=128 ;;
-        ETTm2_336) el=1; nh=4;  bt=32  ;;  ETTm2_720) el=3; nh=4;  bt=128 ;;
-        weather_*) el=2; nh=4;  bt=32; ep=3 ;;
-        exchange_rate_*) el=2; nh=8; bt=32 ;;
-        *) echo "UNKNOWN PatchTST ${ds}_${pred}" >&2; return 1 ;;
-      esac
-      echo "--model PatchTST --e_layers $el --n_heads $nh --d_model 512 --d_ff 2048 --factor 3 --batch_size $bt --learning_rate 0.0001 --train_epochs $ep --patience 3 --dropout 0.1" ;;
-    DLinear)
-      local ind=""; [ "$DLINEAR_INDIVIDUAL" = "1" ] && ind="--individual"
-      echo "--model DLinear --e_layers 2 --d_model 512 --batch_size 32 --learning_rate 0.005 --train_epochs 10 --patience 3 --dropout 0.1 $ind" ;;
-    TimeMixer)
-      local el dm dff bt ds_l lr ep pat drop
-      case "$ds" in
-        ETTh1|ETTh2)   el=2; dm=16; dff=32; bt=128; ds_l=3; lr=0.01; ep=10; pat=3;  drop=0.6 ;;
-        ETTm1)         el=2; dm=16; dff=32; bt=128; ds_l=3; lr=0.01; ep=10; pat=3;  drop=0.1 ;;
-        ETTm2)         el=2; dm=32; dff=64; bt=128; ds_l=3; lr=0.01; ep=10; pat=3;  drop=0.1 ;;
-        weather)       el=2; dm=16; dff=32; bt=128; ds_l=3; lr=0.01; ep=20; pat=10; drop=0.1 ;;
-        exchange_rate) el=2; dm=16; dff=32; bt=32;  ds_l=3; lr=0.01; ep=10; pat=3;  drop=0.1 ;;
-        *) echo "UNKNOWN TimeMixer $ds" >&2; return 1 ;;
-      esac
-      echo "--model TimeMixer --e_layers $el --d_model $dm --d_ff $dff --batch_size $bt --down_sampling_layers $ds_l --down_sampling_method avg --down_sampling_window 2 --channel_independence $TIMEMIXER_CI --learning_rate $lr --train_epochs $ep --patience $pat --dropout $drop" ;;
-    *) echo "UNKNOWN student $student" >&2; return 1 ;;
-  esac
-}
+We feed the SCALED series (data_provider's StandardScaler); TimesFM instance-norms
+internally and denorms, so the cached forecast is in the same scaled space as the
+student's output -> the MSE is well posed.
 
-run_one() {
-  local student=$1 ds=$2 pred=$3 lam=$4 gpu=$5
-  IFS='|' read -r data root_path data_path enc_in <<< "$(get_data "$ds")" || return 1
-  local P; P=$(get_P "$ds")
-  local margs; margs="$(model_args "$student" "$ds" "$pred")" || return 1
+Cache (horizon-specific, unlike the embedding teachers):
+    {root}/timesfm_forecast_{stem}_{pred_len}/{hash}.npy        # [pred_len, N]
+where stem = data_path without ".csv" (ETTh1, exchange_rate, ...).
 
-  local reg_args="" tag="base"
-  if [ "$lam" != "0" ]; then
-    reg_args="--vts_pred_reg --vts_pred_reg_weight $lam --vts_pred_source $SOURCE --vts_pred_periodicity $P --vts_pred_render $VTS_RENDER --vts_pred_ckpt_dir $CKPT_DIR"
-    if [ "$SOURCE" = "timesfm" ]; then tag="tfmreg${lam}"
-    elif [ "$VTS_RENDER" = "ci" ]; then tag="vtsregci${lam}"
-    else tag="vtsreg${lam}"; fi
-  fi
+Setup:
+    pip install timesfm[torch]        # TimesFM 3.0; weights auto-download from HF
 
-  # Variant suffix so channel-mixing / per-channel runs get distinct model_ids.
-  local sfx=""
-  [ "$student" = "TimeMixer" ] && [ "$TIMEMIXER_CI" = "0" ] && sfx="cm"
-  [ "$student" = "DLinear" ] && [ "$DLINEAR_INDIVIDUAL" = "1" ] && sfx="ind"
-  local sname="$student"; [ -n "$sfx" ] && sname="${student}${sfx}"
-  local model_id="${ds}_${sname}_${tag}_96_${pred}"
-  local logf="$LOG_DIR/${model_id}.log"
-  local donef="$LOG_DIR/${model_id}.done"
-  if [ -f "$donef" ]; then echo "[gpu $gpu] SKIP: $model_id"; return 0; fi
-
-  echo "[gpu $gpu] START: $model_id  (P$P lam=$lam)"
-  CUDA_VISIBLE_DEVICES=$gpu python -u run.py \
-    --task_name long_term_forecast --is_training 1 \
-    --root_path "$root_path" --data_path "$data_path" --data "$data" \
-    --model_id "$model_id" --features M \
-    --seq_len 96 --label_len 0 --pred_len "$pred" \
-    --enc_in "$enc_in" --dec_in "$enc_in" --c_out "$enc_in" \
-    --des Exp --itr 1 \
-    $margs $reg_args \
-    > "$logf" 2>&1
-  local rc=$?
-  if [ $rc -eq 0 ]; then touch "$donef"; echo "[gpu $gpu] DONE:  $model_id"
-  else echo "[gpu $gpu] FAIL (rc=$rc): $model_id -> $logf"; fi
-  return $rc
-}
-
-worker() {
-  local gpu=$1; shift
-  for job in "$@"; do
-    IFS=':' read -r student ds pred lam <<< "$job"
-    run_one "$student" "$ds" "$pred" "$lam" "$gpu"
-  done
-}
-
-job_list=""
-for student in $STUDENTS; do
-  for ds in $DATASETS; do
-    for pred in $HORIZONS; do
-      for lam in $LAMBDAS; do
-        job_list="$job_list ${student}:${ds}:${pred}:${lam}"
-      done
+Usage:
+    python utils/precompute_timesfm_forecast.py --dataset ETTh1 --pred_len 96
+    # one run per (dataset, horizon):
+    for pl in 96 192 336 720; do
+      python utils/precompute_timesfm_forecast.py --dataset ETTh1 --pred_len $pl
     done
-  done
-done
+"""
 
-gpu_arr=($GPUS); job_arr=($job_list); ngpu=${#gpu_arr[@]}
-echo "Students: $STUDENTS | Datasets: $DATASETS | LAMBDAS: $LAMBDAS | render: $VTS_RENDER"
-echo "Dispatching ${#job_arr[@]} jobs across $ngpu gpu(s): $GPUS ; logs -> $LOG_DIR/"
+import os
+import sys
+import argparse
+import hashlib
+from pathlib import Path
 
-for idx in "${!gpu_arr[@]}"; do
-  gpu="${gpu_arr[$idx]}"; sel=""; j=$idx
-  while [ $j -lt ${#job_arr[@]} ]; do sel="$sel ${job_arr[$j]}"; j=$((j + ngpu)); done
-  worker "$gpu" $sel &
-done
+import numpy as np
+import torch
+from tqdm import tqdm
 
-wait
-echo "All gpus finished. Collect with: python utils/collect_results.py"
+project_root = str(Path(__file__).resolve().parents[1])
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+DATASET_CONFIGS = {
+    'ETTh1': {'data': 'ETTh1', 'root_path': './dataset/ETT-small/', 'data_path': 'ETTh1.csv', 'freq': 'h'},
+    'ETTh2': {'data': 'ETTh2', 'root_path': './dataset/ETT-small/', 'data_path': 'ETTh2.csv', 'freq': 'h'},
+    'ETTm1': {'data': 'ETTm1', 'root_path': './dataset/ETT-small/', 'data_path': 'ETTm1.csv', 'freq': 't'},
+    'ETTm2': {'data': 'ETTm2', 'root_path': './dataset/ETT-small/', 'data_path': 'ETTm2.csv', 'freq': 't'},
+    'weather': {'data': 'custom', 'root_path': './dataset/weather/', 'data_path': 'weather.csv', 'freq': 'h'},
+    'exchange_rate': {'data': 'custom', 'root_path': './dataset/exchange_rate/', 'data_path': 'exchange_rate.csv', 'freq': 'd'},
+}
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def load_timesfm(device, batch_size):
+    """Load TimesFM 3.0 (PyTorch). Import name differs by version, so try both."""
+    try:
+        from timesfm3 import TimesFM3Evaluator, ModelConfig
+    except ImportError:
+        from timesfm import TimesFM3Evaluator, ModelConfig  # fallback for other layouts
+    cfg = ModelConfig(
+        checkpoint_path="google/timesfm-3.0-pytorch",
+        per_core_batch_size=batch_size,
+        device=device,
+    )
+    return TimesFM3Evaluator(cfg)
+
+
+def forecast_batch(forecaster, contexts, horizon):
+    """contexts: list of 1D float32 arrays -> [len(contexts), horizon]."""
+    outs = list(forecaster.predict_batch(contexts, horizon=horizon,
+                                         return_quantiles=False))
+    return np.stack([np.asarray(o.forecast)[:horizon] for o in outs], axis=0)
+
+
+def get_ts_hash(ts_array):
+    return hashlib.md5(ts_array.astype(np.float32).tobytes()).hexdigest()[:16]
+
+
+def main():
+    from data_provider.data_factory import data_provider
+
+    p = argparse.ArgumentParser(description="Precompute TimesFM forecasts (reg target)")
+    p.add_argument('--dataset', type=str, required=True, choices=list(DATASET_CONFIGS.keys()))
+    p.add_argument('--seq_len', type=int, default=96)
+    p.add_argument('--label_len', type=int, default=0)
+    p.add_argument('--pred_len', type=int, default=96)
+    p.add_argument('--batch_size', type=int, default=32, help='data_provider batch size')
+    p.add_argument('--tfm_batch', type=int, default=32, help='TimesFM per_core_batch_size')
+    p.add_argument('--mode', type=str, default='ci', choices=['ci', 'mv'],
+                   help="ci = each variable forecast alone (univariate); "
+                        "mv = all variables passed as ONE joint (N, L) context, forecast jointly")
+    args = p.parse_args()
+
+    cfg = DATASET_CONFIGS[args.dataset]
+    stem = os.path.splitext(cfg['data_path'])[0]
+    # Separate caches so CI and MV forecasts never overwrite each other.
+    prefix = "timesfm_forecast" if args.mode == 'ci' else "timesfm_mv_forecast"
+    cache_dir = os.path.join(cfg['root_path'], f"{prefix}_{stem}_{args.pred_len}")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    data_args = argparse.Namespace(
+        data=cfg['data'], root_path=cfg['root_path'], data_path=cfg['data_path'],
+        features='M', target='OT', seq_len=args.seq_len, label_len=args.label_len,
+        pred_len=args.pred_len, embed='timeF', freq=cfg['freq'],
+        batch_size=args.batch_size, num_workers=0, seasonal_patterns='Monthly',
+        augmentation_ratio=0, task_name='long_term_forecast',
+    )
+
+    print(f"Dataset: {args.dataset}  pred_len: {args.pred_len}  mode: {args.mode}  device: {DEVICE}")
+    print(f"Cache:   {cache_dir}")
+    print("Loading TimesFM 3.0 ...")
+    forecaster = load_timesfm(DEVICE, args.tfm_batch)
+
+    existing = set(f[:-4] for f in os.listdir(cache_dir) if f.endswith('.npy'))
+    for flag in ['train', 'val', 'test']:
+        print(f"\n{'='*50}\n{flag.upper()}\n{'='*50}")
+        _, loader = data_provider(data_args, flag)
+        generated, skipped = 0, 0
+        for batch_x, _, _, _ in tqdm(loader):
+            x = batch_x.float().numpy().astype(np.float32)   # [B, L, N]
+            B, L, N = x.shape
+
+            if args.mode == 'mv':
+                # Joint multivariate: one (N, L) context per sample -> forecast (N, pred_len).
+                contexts, hashes = [], []
+                for b in range(B):
+                    h = get_ts_hash(x[b])
+                    if h in existing:
+                        skipped += 1
+                        continue
+                    contexts.append(np.ascontiguousarray(x[b].T))  # [N, L]
+                    hashes.append(h)
+                if not contexts:
+                    continue
+                outs = list(forecaster.predict_batch(contexts, horizon=args.pred_len,
+                                                     return_quantiles=False))
+                for h, o in zip(hashes, outs):
+                    f = np.asarray(o.forecast)[:, :args.pred_len].T.astype(np.float32)  # [pred_len, N]
+                    np.save(os.path.join(cache_dir, f"{h}.npy"), f)
+                    existing.add(h)
+                    generated += 1
+                continue
+
+            contexts, metas = [], []
+            for b in range(B):
+                h = get_ts_hash(x[b])
+                if h in existing:
+                    skipped += 1
+                    continue
+                for n in range(N):
+                    contexts.append(x[b, :, n])              # [L]
+                metas.append((h, N))
+            if not contexts:
+                continue
+            fc = forecast_batch(forecaster, contexts, args.pred_len)  # [sum_N, pred_len]
+            idx = 0
+            for (h, n_vars) in metas:
+                f = fc[idx:idx + n_vars].T.astype(np.float32)        # [pred_len, N]
+                np.save(os.path.join(cache_dir, f"{h}.npy"), f)
+                existing.add(h)
+                idx += n_vars
+                generated += 1
+        print(f"  Generated: {generated}, Skipped: {skipped}")
+
+    total = len([f for f in os.listdir(cache_dir) if f.endswith('.npy')])
+    print(f"\nDone! Total cached forecasts: {total}  ->  {cache_dir}")
+
+
+if __name__ == '__main__':
+    main()
