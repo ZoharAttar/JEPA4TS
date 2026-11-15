@@ -147,6 +147,10 @@ worker() {
   done
 }
 
+# Everything below only runs when the script is executed. When it is SOURCED (e.g. by
+# scripts/robustness/vts_reg_noise.sh) only the config functions above are loaded.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+
 job_list=""
 for student in $STUDENTS; do
   for ds in $DATASETS; do
@@ -172,3 +176,5 @@ done
 
 wait
 echo "All gpus finished. Collect with: python utils/collect_results.py"
+
+fi
