@@ -91,11 +91,16 @@ def main():
     p.add_argument('--pred_len', type=int, default=96)
     p.add_argument('--batch_size', type=int, default=32, help='data_provider batch size')
     p.add_argument('--tfm_batch', type=int, default=32, help='TimesFM per_core_batch_size')
+    p.add_argument('--mode', type=str, default='ci', choices=['ci', 'mv'],
+                   help="ci = each variable forecast alone (univariate); "
+                        "mv = all variables passed as ONE joint (N, L) context, forecast jointly")
     args = p.parse_args()
 
     cfg = DATASET_CONFIGS[args.dataset]
     stem = os.path.splitext(cfg['data_path'])[0]
-    cache_dir = os.path.join(cfg['root_path'], f"timesfm_forecast_{stem}_{args.pred_len}")
+    # Separate caches so CI and MV forecasts never overwrite each other.
+    prefix = "timesfm_forecast" if args.mode == 'ci' else "timesfm_mv_forecast"
+    cache_dir = os.path.join(cfg['root_path'], f"{prefix}_{stem}_{args.pred_len}")
     os.makedirs(cache_dir, exist_ok=True)
 
     data_args = argparse.Namespace(
@@ -106,7 +111,7 @@ def main():
         augmentation_ratio=0, task_name='long_term_forecast',
     )
 
-    print(f"Dataset: {args.dataset}  pred_len: {args.pred_len}  device: {DEVICE}")
+    print(f"Dataset: {args.dataset}  pred_len: {args.pred_len}  mode: {args.mode}  device: {DEVICE}")
     print(f"Cache:   {cache_dir}")
     print("Loading TimesFM 3.0 ...")
     forecaster = load_timesfm(DEVICE, args.tfm_batch)
@@ -119,6 +124,28 @@ def main():
         for batch_x, _, _, _ in tqdm(loader):
             x = batch_x.float().numpy().astype(np.float32)   # [B, L, N]
             B, L, N = x.shape
+
+            if args.mode == 'mv':
+                # Joint multivariate: one (N, L) context per sample -> forecast (N, pred_len).
+                contexts, hashes = [], []
+                for b in range(B):
+                    h = get_ts_hash(x[b])
+                    if h in existing:
+                        skipped += 1
+                        continue
+                    contexts.append(np.ascontiguousarray(x[b].T))  # [N, L]
+                    hashes.append(h)
+                if not contexts:
+                    continue
+                outs = list(forecaster.predict_batch(contexts, horizon=args.pred_len,
+                                                     return_quantiles=False))
+                for h, o in zip(hashes, outs):
+                    f = np.asarray(o.forecast)[:, :args.pred_len].T.astype(np.float32)  # [pred_len, N]
+                    np.save(os.path.join(cache_dir, f"{h}.npy"), f)
+                    existing.add(h)
+                    generated += 1
+                continue
+
             contexts, metas = [], []
             for b in range(B):
                 h = get_ts_hash(x[b])
