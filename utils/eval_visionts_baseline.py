@@ -102,8 +102,10 @@ def main():
 
     p = argparse.ArgumentParser(description="VisionTS++ standalone baseline forecaster")
     p.add_argument('--dataset', type=str, required=True, choices=list(DATASET_CONFIGS.keys()))
-    p.add_argument('--mode', type=str, required=True, choices=['ci', 'mv'],
-                   help="ci = channel-independent (per-var grayscale), mv = colorized multivariate")
+    p.add_argument('--mode', type=str, required=True, choices=['ci', 'mv', 'mvgray'],
+                   help="ci = channel-independent (per-var grayscale), mv = colorized multivariate, "
+                        "mvgray = all vars in ONE grayscale image (the repo's zero-shot LTSF "
+                        "scripts default: color=0)")
     p.add_argument('--arch', type=str, default='mae_base', choices=list(ARCH_DIM.keys()))
     p.add_argument('--ckpt_path', type=str, default=None)
     p.add_argument('--ckpt_dir', type=str, default='./hf_models/VisionTSpp')
@@ -124,7 +126,7 @@ def main():
 
     cfg = DATASET_CONFIGS[args.dataset]
     periodicity = args.periodicity if args.periodicity > 0 else cfg['periodicity']
-    color = (args.mode == 'mv')   # colorized for multivariate; grayscale for CI
+    color = (args.mode == 'mv')   # colorized only for 'mv'; grayscale for 'ci' and 'mvgray'
 
     data_args = argparse.Namespace(
         data=cfg['data'], root_path=cfg['root_path'], data_path=cfg['data_path'],
@@ -162,7 +164,7 @@ def main():
             noise = torch.randn(batch_x.shape, generator=gen, device=DEVICE, dtype=batch_x.dtype)
             batch_x = batch_x + (noise_pct / 100.0) * std_vec * noise
         true = batch_y[:, -args.pred_len:, :].float().to(DEVICE)
-        if args.mode == 'mv':
+        if args.mode in ('mv', 'mvgray'):   # all variables packed into one image
             pred = forecast_mv(model, batch_x, args.pred_len)
         else:
             pred = forecast_ci(model, batch_x, args.pred_len, var_chunk=args.var_chunk)
