@@ -12,7 +12,7 @@
 #   split. Ground-truth targets stay clean. Deterministic given --seed.
 # (Same definition as scripts/robustness/forecast_noise.sh / exchange_noise.sh.)
 #
-# Two phases:
+# Two phases, each spread over GPUS (one job per GPU at a time, round-robin):
 #   1) Train (or reuse) the CLEAN PatchTST checkpoints. Configs come from
 #      scripts/long_term_forecast/vts_pred_reg_multi.sh (sourced), so checkpoints
 #      already trained by that script (or PatchTST_vts_pred_reg.sh) are reused.
@@ -22,12 +22,13 @@
 #      loss, so it is not needed at test time). VisionTS++ is evaluated directly.
 #
 # Usage:
-#   bash scripts/robustness/vts_reg_noise.sh
-#   GPU=1 DATASETS="ETTh1 ETTh2 exchange_rate" NOISE_LEVELS="0 5 10 20 30" \
+#   GPUS="0 1 2 3" bash scripts/robustness/vts_reg_noise.sh
+#   GPU=0 bash scripts/robustness/vts_reg_noise.sh            # single GPU still works
+#   GPUS="0 1" DATASETS="ETTh1 ETTh2 exchange_rate" NOISE_LEVELS="0 5 10 20 30" \
 #     bash scripts/robustness/vts_reg_noise.sh
 #
 # Env overrides:
-#   GPU=0                          gpu id
+#   GPUS="0 1 2 3"                 gpus to spread jobs over (falls back to GPU, then 0)
 #   DATASETS="ETTh1 ETTh2 exchange_rate"
 #   NOISE_LEVELS="0 5 10 20"       percent noise sweep
 #   HORIZONS=""                    empty = each dataset's standard horizons
@@ -41,10 +42,13 @@
 
 cd "$(dirname "$0")/../.."
 
+# Resolve GPUs BEFORE sourcing (the sourced script sets its own GPUS default).
+_NOISE_GPUS="${GPUS:-${GPU:-0}}"
+
 # Load get_ds / model_args / run_one (config only; sourcing does not launch jobs).
 source scripts/long_term_forecast/vts_pred_reg_multi.sh
 
-GPU="${GPU:-0}"
+GPUS="$_NOISE_GPUS"
 NOISE_LEVELS="${NOISE_LEVELS:-0 5 10 20}"
 VARIANTS="${VARIANTS:-patchtst_base patchtst_vtsreg visionts}"
 REG_LAMBDA="${REG_LAMBDA:-1.0}"
@@ -94,65 +98,99 @@ get_metric() {  # $1=logfile -> "MSE MAE" from the last "mse:..., mae:..." line
 
 horizons_of() { local cfg; cfg="$(get_ds "$1")" || return 1; echo "${HORIZONS:-$(printf '%s' "$cfg" | cut -d'|' -f6)}"; }
 
-echo "Variants: $VARIANTS | Datasets: $DATASETS | Noise: $NOISE_LEVELS | lambda=$REG_LAMBDA | GPU $GPU"
+# ── one job of each phase ───────────────────────────────────────────────────
+train_job() {  # ds p variant gpu
+  local ds=$1 p=$2 v=$3 gpu=$4
+  local data root_path data_path enc_in seq _hz P margs mid
+  IFS='|' read -r data root_path data_path enc_in seq _hz P <<< "$(get_ds "$ds")"
+  margs="$(model_args PatchTST "$ds" "$p")" || return 1
+  mid="$(train_model_id "$v" "$ds" "$seq" "$p")"
+  if find_ckpt "$mid" "$data" "$seq" "$p" "$margs" >/dev/null; then
+    echo "  [gpu $gpu][train] SKIP (ckpt exists): $mid"
+  else
+    echo "  [gpu $gpu][train] $mid (clean)"
+    run_one PatchTST "$ds" "$p" "$(variant_lambda "$v")" "$gpu"
+  fi
+}
 
+eval_job() {  # ds noise variant p gpu
+  local ds=$1 n=$2 v=$3 p=$4 gpu=$5
+  local data root_path data_path enc_in seq _hz P margs mid ckpt
+  IFS='|' read -r data root_path data_path enc_in seq _hz P <<< "$(get_ds "$ds")"
+  local logf="$NOISE_LOG_DIR/eval_${ds}_${v}_pl${p}_noise${n}.log"
+  if [ "$v" = "visionts" ]; then
+    echo "  [gpu $gpu][eval] $ds visionts pl$p noise${n}%"
+    CUDA_VISIBLE_DEVICES=$gpu python -u utils/eval_visionts_baseline.py \
+      --dataset "$ds" --mode mv --seq_len "$seq" --pred_len "$p" --periodicity "$P" \
+      --test_noise "$n" --seed "$SEED" --ckpt_dir "$CKPT_DIR" \
+      --results_file "$VTS_RESULTS" > "$logf" 2>&1 \
+      || echo "  [gpu $gpu][eval] FAIL: $ds visionts pl$p noise${n} -> $logf"
+    return
+  fi
+  margs="$(model_args PatchTST "$ds" "$p")" || return 1
+  mid="$(train_model_id "$v" "$ds" "$seq" "$p")"
+  ckpt="$(find_ckpt "$mid" "$data" "$seq" "$p" "$margs")" \
+    || { echo "  [gpu $gpu][eval] MISSING ckpt, skip: $mid (noise${n})"; return; }
+  echo "  [gpu $gpu][eval] $ds $v pl$p noise${n}%"
+  CUDA_VISIBLE_DEVICES=$gpu python -u run.py \
+    --task_name long_term_forecast --is_training 0 \
+    --root_path "$root_path" --data_path "$data_path" --data "$data" \
+    --model_id "${mid}_noise${n}" --features M \
+    --seq_len "$seq" --label_len 0 --pred_len "$p" \
+    --enc_in "$enc_in" --dec_in "$enc_in" --c_out "$enc_in" \
+    --des Exp --itr 1 $margs \
+    --transfer_checkpoint "$ckpt" --test_noise "$n" --seed "$SEED" \
+    > "$logf" 2>&1 \
+    || echo "  [gpu $gpu][eval] FAIL: $ds $v pl$p noise${n} -> $logf"
+}
+
+# Run "<fn> <job>" for every job, round-robin across GPUS, one job per GPU at a time.
+dispatch() {
+  local fn=$1; shift
+  local jobs=("$@") gpu_arr=($GPUS) ngpu idx gpu j
+  ngpu=${#gpu_arr[@]}
+  for idx in "${!gpu_arr[@]}"; do
+    gpu="${gpu_arr[$idx]}"
+    (
+      j=$idx
+      while [ $j -lt ${#jobs[@]} ]; do
+        IFS=':' read -r -a a <<< "${jobs[$j]}"
+        "$fn" "${a[@]}" "$gpu"
+        j=$((j + ngpu))
+      done
+    ) &
+  done
+  wait
+}
+
+echo "Variants: $VARIANTS | Datasets: $DATASETS | Noise: $NOISE_LEVELS | lambda=$REG_LAMBDA | GPUs: $GPUS"
+
+# ── Phase 1: clean PatchTST checkpoints (train only what is missing) ────────
+train_jobs=()
 for ds in $DATASETS; do
-  IFS='|' read -r data root_path data_path enc_in seq _hz P <<< "$(get_ds "$ds")" || exit 1
-  echo "══════════════════════════════════════════════════════════════════"
-  echo " DATASET: $ds"
-  echo "══════════════════════════════════════════════════════════════════"
-
-  # ── Phase 1: clean PatchTST checkpoints (train only what is missing) ──
+  get_ds "$ds" >/dev/null || exit 1
   for v in $VARIANTS; do
     [ "$v" = "visionts" ] && continue
-    for p in $(horizons_of "$ds"); do
-      margs="$(model_args PatchTST "$ds" "$p")" || exit 1
-      mid="$(train_model_id "$v" "$ds" "$seq" "$p")"
-      if find_ckpt "$mid" "$data" "$seq" "$p" "$margs" >/dev/null; then
-        echo "  [train] SKIP (ckpt exists): $mid"
-      else
-        echo "  [train] $mid (clean)"
-        run_one PatchTST "$ds" "$p" "$(variant_lambda "$v")" "$GPU"
-      fi
-    done
+    for p in $(horizons_of "$ds"); do train_jobs+=("${ds}:${p}:${v}"); done
   done
+done
+echo "Phase 1: ${#train_jobs[@]} clean-checkpoint jobs"
+[ ${#train_jobs[@]} -gt 0 ] && dispatch train_job "${train_jobs[@]}"
 
-  # ── Phase 2: noisy test-input evaluation ──
+# ── Phase 2: noisy test-input evaluation ─────────────────────────────────────
+eval_jobs=()
+for ds in $DATASETS; do
   for n in $NOISE_LEVELS; do
     for v in $VARIANTS; do
-      for p in $(horizons_of "$ds"); do
-        logf="$NOISE_LOG_DIR/eval_${ds}_${v}_pl${p}_noise${n}.log"
-        if [ "$v" = "visionts" ]; then
-          if [[ " $VTS_EVAL_DATASETS " != *" $ds "* ]]; then
-            echo "  [eval] SKIP visionts on $ds (evaluator supports: $VTS_EVAL_DATASETS)"; continue
-          fi
-          echo "  [eval] $ds visionts pl$p noise${n}%"
-          CUDA_VISIBLE_DEVICES=$GPU python -u utils/eval_visionts_baseline.py \
-            --dataset "$ds" --mode mv --seq_len "$seq" --pred_len "$p" --periodicity "$P" \
-            --test_noise "$n" --seed "$SEED" --ckpt_dir "$CKPT_DIR" \
-            --results_file "$VTS_RESULTS" > "$logf" 2>&1 \
-            || echo "  [eval] FAIL: $ds visionts pl$p noise${n} -> $logf"
-        else
-          margs="$(model_args PatchTST "$ds" "$p")" || exit 1
-          mid="$(train_model_id "$v" "$ds" "$seq" "$p")"
-          ckpt="$(find_ckpt "$mid" "$data" "$seq" "$p" "$margs")" \
-            || { echo "  [eval] MISSING ckpt, skip: $mid (noise${n})"; continue; }
-          echo "  [eval] $ds $v pl$p noise${n}%"
-          CUDA_VISIBLE_DEVICES=$GPU python -u run.py \
-            --task_name long_term_forecast --is_training 0 \
-            --root_path "$root_path" --data_path "$data_path" --data "$data" \
-            --model_id "${mid}_noise${n}" --features M \
-            --seq_len "$seq" --label_len 0 --pred_len "$p" \
-            --enc_in "$enc_in" --dec_in "$enc_in" --c_out "$enc_in" \
-            --des Exp --itr 1 $margs \
-            --transfer_checkpoint "$ckpt" --test_noise "$n" --seed "$SEED" \
-            > "$logf" 2>&1 \
-            || echo "  [eval] FAIL: $ds $v pl$p noise${n} -> $logf"
-        fi
-      done
+      if [ "$v" = "visionts" ] && [[ " $VTS_EVAL_DATASETS " != *" $ds "* ]]; then
+        echo "  SKIP visionts on $ds (evaluator supports: $VTS_EVAL_DATASETS)"; continue
+      fi
+      for p in $(horizons_of "$ds"); do eval_jobs+=("${ds}:${n}:${v}:${p}"); done
     done
   done
 done
+echo "Phase 2: ${#eval_jobs[@]} noisy-eval jobs"
+[ ${#eval_jobs[@]} -gt 0 ] && dispatch eval_job "${eval_jobs[@]}"
 
 # ── Summary ───────────────────────────────────────────────────────────────
 tsv="$NOISE_LOG_DIR/summary.tsv"
