@@ -258,8 +258,13 @@ if __name__ == '__main__':
                         help='Weight on the VisionTS++ prediction-regularizer MSE term')
     parser.add_argument('--vts_pred_render', type=str, default='mv', choices=['mv', 'ci'],
                         help='Teacher forecast rendering: mv (colorized multivariate) | ci (per-variable)')
-    parser.add_argument('--vts_pred_source', type=str, default='visionts', choices=['visionts', 'timesfm'],
-                        help='Reg teacher: visionts (VisionTS++, on-the-fly) | timesfm (precomputed, non-vision ablation)')
+    parser.add_argument('--vts_pred_source', type=str, default='visionts',
+                        choices=['visionts', 'timesfm', 'timesfm_mv'],
+                        help='Reg teacher: visionts (VisionTS++, on-the-fly) | timesfm (precomputed, '
+                             'univariate/CI) | timesfm_mv (precomputed, joint multivariate)')
+    parser.add_argument('--vts_pred_mv_group', type=int, default=21,
+                        help='MV teacher: max variables per colorized image; wider datasets '
+                             '(electricity/traffic) are split into channel groups of this size')
     parser.add_argument('--vts_pred_periodicity', type=int, default=24,
                         help='Periodicity for VisionTS++ image rendering (ETT hourly=24)')
     parser.add_argument('--vts_pred_arch', type=str, default='mae_base',
