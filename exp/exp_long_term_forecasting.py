@@ -29,19 +29,22 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # Teacher forecast source: 'visionts' (VisionTS++, on-the-fly) or 'timesfm'
         # (precomputed TimesFM forecasts loaded by hash). TimesFM is the non-vision
         # ablation: same regularizer, a TS foundation model instead of a visual one.
+        # 'timesfm' = univariate (CI) TimesFM forecasts; 'timesfm_mv' = joint
+        # multivariate TimesFM forecasts (all channels in one context).
         self.vts_source = getattr(args, 'vts_pred_source', 'visionts')
-        if self.vts_reg and self.vts_source == 'timesfm':
+        if self.vts_reg and self.vts_source.startswith('timesfm'):
             import os as _os
             stem = _os.path.splitext(_os.path.basename(args.data_path))[0]
-            self.tfm_cache = _os.path.join(args.root_path,
-                                           f"timesfm_forecast_{stem}_{args.pred_len}")
+            prefix = "timesfm_mv_forecast" if self.vts_source == 'timesfm_mv' else "timesfm_forecast"
+            mode = 'mv' if self.vts_source == 'timesfm_mv' else 'ci'
+            self.tfm_cache = _os.path.join(args.root_path, f"{prefix}_{stem}_{args.pred_len}")
             if not _os.path.isdir(self.tfm_cache):
                 raise ValueError(f"TimesFM cache not found: {self.tfm_cache}\n"
                                  f"   Run utils/precompute_timesfm_forecast.py --dataset {stem} "
-                                 f"--pred_len {args.pred_len} first!")
+                                 f"--pred_len {args.pred_len} --mode {mode} first!")
             self.vts_reg_weight = getattr(args, 'vts_pred_reg_weight', 1.0)
             n = len([f for f in os.listdir(self.tfm_cache) if f.endswith('.npy')])
-            print(f"[pred-reg] source=timesfm, weight={self.vts_reg_weight}, "
+            print(f"[pred-reg] source={self.vts_source}, weight={self.vts_reg_weight}, "
                   f"cache={self.tfm_cache} ({n} forecasts)")
         elif self.vts_reg:
             from visionts import VisionTSpp
@@ -75,7 +78,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         'ci': fold vars into the batch, forecast each variable on its own image.
         Forced to fp32 (autocast disabled) for a stable teacher target.
         """
-        if self.vts_source == 'timesfm':
+        if self.vts_source.startswith('timesfm'):
             return self._timesfm_cached(batch_x, f_dim)
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
             x = batch_x.float()
@@ -87,11 +90,37 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     y = y[0]
                 y = y[..., 0].reshape(B, N, -1).permute(0, 2, 1)  # [B, pred_len, N]
             else:
-                y = self.vts_teacher.forward(x)
-                if isinstance(y, (list, tuple)):
-                    y = y[0]                            # quantile median
+                y = self._vts_mv_grouped(x)
             y = y[:, -self.args.pred_len:, f_dim:]
         return y.detach()
+
+    def _vts_mv_grouped(self, x, max_images=256):
+        """MV forecast, splitting wide datasets into channel groups.
+
+        MV packs every variable into one 224-px image (224 // N rows each), which
+        breaks once N is large (electricity 321, traffic 862 -> 0 rows). If N exceeds
+        --vts_pred_mv_group (default 21), split the channels into groups of that size,
+        render each group as its own MV image, and stitch the forecasts back. N <= group
+        is a single image, so ETT (7) / exchange (8) / weather (21) are unchanged.
+        """
+        def fwd(inp):
+            out = self.vts_teacher.forward(inp)
+            return out[0] if isinstance(out, (list, tuple)) else out  # quantile median
+
+        B, L, N = x.shape
+        G = getattr(self.args, 'vts_pred_mv_group', 21)
+        if N <= G:
+            return fwd(x)
+        n_chunks = -(-N // G)
+        pad = n_chunks * G - N
+        if pad:  # replicate the last channel (avoids zero-variance series), dropped later
+            x = torch.cat([x, x[..., -1:].expand(B, L, pad)], dim=-1)
+        xc = x.reshape(B, L, n_chunks, G).permute(0, 2, 1, 3).reshape(B * n_chunks, L, G)
+        ys = [fwd(xc[s:s + max_images]) for s in range(0, xc.shape[0], max_images)]
+        y = torch.cat(ys, dim=0)                                  # [B*n_chunks, P, G]
+        P = y.shape[1]
+        y = y.reshape(B, n_chunks, P, G).permute(0, 2, 1, 3).reshape(B, P, n_chunks * G)
+        return y[..., :N]
 
     def _timesfm_cached(self, batch_x, f_dim):
         """Load precomputed TimesFM forecast target by input-window hash.
