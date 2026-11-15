@@ -115,6 +115,11 @@ def main():
     p.add_argument('--batch_size', type=int, default=32)
     p.add_argument('--var_chunk', type=int, default=64, help='CI mode: max var-images per encoder call')
     p.add_argument('--results_file', type=str, default='result_visionts_baseline.txt')
+    p.add_argument('--test_noise', type=float, default=None,
+                   help='Robustness eval: Gaussian noise on the test INPUT window only, std = '
+                        '(test_noise/100) * per-variable std over the test split (same definition '
+                        'as exp_basic._make_noise_ctx). When given, the tag gets a _noise<n> suffix.')
+    p.add_argument('--seed', type=int, default=2021, help='seed for the noise generator')
     args = p.parse_args()
 
     cfg = DATASET_CONFIGS[args.dataset]
@@ -129,6 +134,8 @@ def main():
     )
 
     tag = f"VisionTSpp_baseline_{args.dataset}_{args.mode}_{args.seq_len}_{args.pred_len}"
+    if args.test_noise is not None:
+        tag += f"_noise{args.test_noise:g}"
     print(f"{'='*60}\n{tag}\n{'='*60}")
     print(f"mode={args.mode}  color={color}  periodicity={periodicity}  device={DEVICE}")
 
@@ -137,11 +144,23 @@ def main():
                         periodicity=periodicity, norm_const=args.norm_const,
                         align_const=args.align_const)
 
-    _, loader = data_provider(data_args, 'test')
+    test_data, loader = data_provider(data_args, 'test')
+
+    # Test-input noise, mirroring exp_basic._make_noise_ctx / _apply_noise.
+    noise_pct = float(args.test_noise or 0.0)
+    if noise_pct > 0:
+        std = np.std(np.asarray(test_data.data_x, dtype=np.float32), axis=0)
+        std_vec = torch.tensor(std, dtype=torch.float32, device=DEVICE).view(1, 1, -1)
+        gen = torch.Generator(device=DEVICE)
+        gen.manual_seed(args.seed)
+        print(f"Test-input noise ENABLED: std = {noise_pct:g}% of per-variable std (seed={args.seed})")
 
     se_sum, ae_sum, count = 0.0, 0.0, 0   # running sums for MSE / MAE in scaled space
     for batch_x, batch_y, _, _ in tqdm(loader, desc=tag):
         batch_x = batch_x.float().to(DEVICE)
+        if noise_pct > 0:
+            noise = torch.randn(batch_x.shape, generator=gen, device=DEVICE, dtype=batch_x.dtype)
+            batch_x = batch_x + (noise_pct / 100.0) * std_vec * noise
         true = batch_y[:, -args.pred_len:, :].float().to(DEVICE)
         if args.mode == 'mv':
             pred = forecast_mv(model, batch_x, args.pred_len)
