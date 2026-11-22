@@ -259,10 +259,16 @@ if __name__ == '__main__':
     parser.add_argument('--vts_pred_render', type=str, default='mv', choices=['mv', 'ci'],
                         help='Teacher forecast rendering: mv (colorized multivariate) | ci (per-variable)')
     parser.add_argument('--vts_pred_source', type=str, default='visionts',
-                        choices=['visionts', 'timesfm', 'timesfm_mv', 'visionts_long'],
+                        choices=['visionts', 'timesfm', 'timesfm_mv', 'visionts_long', 'wavelet'],
                         help='Reg teacher: visionts (VisionTS++, on-the-fly) | timesfm (precomputed, '
                              'univariate/CI) | timesfm_mv (precomputed, joint multivariate) | '
                              'visionts_long (precomputed VisionTS++ MV with a longer teacher look-back)')
+    parser.add_argument('--wavelet', type=str, default='sym5',
+                        help="wavelet source: PyWavelets wavelet name (e.g. sym5, db4, haar)")
+    parser.add_argument('--wavelet_level', type=int, default=2,
+                        help='wavelet source: number of finest detail levels zeroed (more = smoother)')
+    parser.add_argument('--wavelet_mode', type=str, default='symmetric',
+                        help='wavelet source: PyWavelets signal-extension mode')
     parser.add_argument('--vts_teacher_seq_len', type=int, default=0,
                         help="visionts_long only: teacher look-back (e.g. 2304 for ETTm1); the "
                              "student keeps --seq_len")
