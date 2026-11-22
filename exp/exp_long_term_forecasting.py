@@ -35,7 +35,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # look-back (--vts_teacher_seq_len) ending at the same step as the student's
         # 96-step window; windows without enough history have no entry and are masked.
         self.vts_source = getattr(args, 'vts_pred_source', 'visionts')
-        if self.vts_reg and (self.vts_source.startswith('timesfm') or self.vts_source == 'visionts_long'):
+        if self.vts_reg and self.vts_source == 'wavelet':
+            # 'wavelet' = smoothing ablation: the reg target is a wavelet-denoised copy of
+            # the TRUE label (no model). Tests whether the foundation-model teachers help
+            # mainly as smoothers.
+            import pywt  # noqa: F401  (fail early if PyWavelets is missing)
+            self.vts_reg_weight = getattr(args, 'vts_pred_reg_weight', 1.0)
+            self.wav_name = getattr(args, 'wavelet', 'sym5')
+            self.wav_level = getattr(args, 'wavelet_level', 2)
+            self.wav_mode = getattr(args, 'wavelet_mode', 'symmetric')
+            print(f"[pred-reg] source=wavelet ({self.wav_name}, zero {self.wav_level} finest "
+                  f"detail levels, mode={self.wav_mode}), weight={self.vts_reg_weight}")
+        elif self.vts_reg and (self.vts_source.startswith('timesfm') or self.vts_source == 'visionts_long'):
             import os as _os
             stem = _os.path.splitext(_os.path.basename(args.data_path))[0]
             if self.vts_source == 'visionts_long':
@@ -165,9 +176,34 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         m = torch.tensor(mask, device=batch_x.device)
         return y[:, -self.args.pred_len:, f_dim:].detach(), m
 
-    def _reg_term(self, outputs, batch_x, f_dim):
+    def _wavelet_smooth_label(self, batch_x, batch_y, f_dim):
+        """Wavelet-smoothed copy of the label.
+
+        Smooths [input window ; label] jointly along time (so the label's left edge has
+        real context instead of a boundary artifact), zeroes the `wavelet_level` finest
+        detail-coefficient levels, reconstructs, and returns the label part.
+        batch_x: [B, L, N], batch_y: [B, P, N'] -> [B, P, N'] detached.
+        """
+        import pywt
+        ctx = batch_x[..., f_dim:].detach().float().cpu().numpy()
+        lab = batch_y.detach().float().cpu().numpy()
+        full = np.concatenate([ctx, lab], axis=1)                  # [B, L+P, N']
+        coeffs = pywt.wavedec(full, self.wav_name, mode=self.wav_mode, axis=1)
+        k = min(self.wav_level, len(coeffs) - 1)                   # coeffs[0] = approximation
+        for i in range(1, k + 1):
+            coeffs[-i] = np.zeros_like(coeffs[-i])
+        smooth = pywt.waverec(coeffs, self.wav_name, mode=self.wav_mode, axis=1)
+        smooth = smooth[:, :full.shape[1], :]                      # waverec can add 1 step
+        y = smooth[:, -lab.shape[1]:, :]
+        return torch.from_numpy(np.ascontiguousarray(y)).to(batch_y.device).float()
+
+    def _reg_term(self, outputs, batch_x, f_dim, batch_y=None):
         """Prediction-regularizer MSE between the student forecast and the teacher's.
-        For 'visionts_long', samples without a teacher forecast are masked out."""
+        For 'visionts_long', samples without a teacher forecast are masked out.
+        For 'wavelet', the target is the wavelet-smoothed true label."""
+        if self.vts_source == 'wavelet':
+            y = self._wavelet_smooth_label(batch_x, batch_y, f_dim)
+            return nn.functional.mse_loss(outputs, y.to(outputs.dtype))
         if self.vts_source == 'visionts_long':
             y, m = self._cached_forecast(batch_x, f_dim, allow_missing=True)
             if m.sum() == 0:
@@ -284,7 +320,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
                         if self.vts_reg:
-                            loss = loss + self.vts_reg_weight * self._reg_term(outputs, batch_x, f_dim)
+                            loss = loss + self.vts_reg_weight * self._reg_term(outputs, batch_x, f_dim, batch_y)
                         train_loss.append(loss.item())
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
@@ -294,7 +330,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
                     if self.vts_reg:
-                        loss = loss + self.vts_reg_weight * self._reg_term(outputs, batch_x, f_dim)
+                        loss = loss + self.vts_reg_weight * self._reg_term(outputs, batch_x, f_dim, batch_y)
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
