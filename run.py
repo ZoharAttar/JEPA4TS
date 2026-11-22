@@ -259,9 +259,13 @@ if __name__ == '__main__':
     parser.add_argument('--vts_pred_render', type=str, default='mv', choices=['mv', 'ci'],
                         help='Teacher forecast rendering: mv (colorized multivariate) | ci (per-variable)')
     parser.add_argument('--vts_pred_source', type=str, default='visionts',
-                        choices=['visionts', 'timesfm', 'timesfm_mv'],
+                        choices=['visionts', 'timesfm', 'timesfm_mv', 'visionts_long'],
                         help='Reg teacher: visionts (VisionTS++, on-the-fly) | timesfm (precomputed, '
-                             'univariate/CI) | timesfm_mv (precomputed, joint multivariate)')
+                             'univariate/CI) | timesfm_mv (precomputed, joint multivariate) | '
+                             'visionts_long (precomputed VisionTS++ MV with a longer teacher look-back)')
+    parser.add_argument('--vts_teacher_seq_len', type=int, default=0,
+                        help="visionts_long only: teacher look-back (e.g. 2304 for ETTm1); the "
+                             "student keeps --seq_len")
     parser.add_argument('--vts_pred_mv_group', type=int, default=21,
                         help='MV teacher: max variables per colorized image; wider datasets '
                              '(electricity/traffic) are split into channel groups of this size')
