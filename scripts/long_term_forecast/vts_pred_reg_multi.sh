@@ -24,7 +24,7 @@ DATASETS="${DATASETS:-ETTh1 ETTh2 exchange_rate}"
 HORIZONS="${HORIZONS:-}"             # empty = each dataset's standard horizons
 LAMBDAS="${LAMBDAS:-0 1.0}"          # 0 = baseline; 1.0 = reg (best from the sweep)
 VTS_RENDER="${VTS_RENDER:-mv}"       # mv | ci
-SOURCE="${SOURCE:-visionts}"         # reg teacher: visionts | timesfm (CI) | timesfm_mv (joint multivariate)
+SOURCE="${SOURCE:-visionts}"         # reg teacher: visionts | timesfm (CI) | timesfm_mv (joint multivariate) | visionts_long
 # Student channel-handling variants:
 TIMEMIXER_CI="${TIMEMIXER_CI:-1}"        # TimeMixer: 1 = channel-independent (default), 0 = channel-mixing
 DLINEAR_INDIVIDUAL="${DLINEAR_INDIVIDUAL:-0}"  # DLinear: 0 = shared weights (default), 1 = per-channel weights
@@ -47,6 +47,17 @@ get_ds() { case "$1" in
   exchange_rate)    echo "custom|./dataset/exchange_rate/|exchange_rate.csv|8|96|96 192 336 720|1" ;;
   national_illness) echo "custom|./dataset/illness/|national_illness.csv|7|36|24 36 48 60|4" ;;
   *) echo "UNKNOWN dataset: $1" >&2; return 1 ;; esac; }
+
+# SOURCE=visionts_long: teacher look-back | periodicity per dataset, fixed in advance from
+# the VisionTS++ repo's zero-shot LTSF scripts (not tuned on test). The student keeps 96.
+get_long() { case "$1" in
+  ETTh1)       echo "2880|24" ;;
+  ETTh2)       echo "1728|24" ;;
+  ETTm1)       echo "2304|96" ;;
+  ETTm2)       echo "4032|96" ;;
+  weather)     echo "4032|144" ;;
+  electricity) echo "2880|24" ;;
+  *) echo "NO long-context teacher setting for: $1" >&2; return 1 ;; esac; }
 
 # Student-specific run.py flags (everything except data/seq/pred/reg args).
 # Hyperparameters follow the official scripts in scripts/long_term_forecast/*_script.
@@ -106,8 +117,15 @@ run_one() {
 
   local reg_args="" tag="base"
   if [ "$lam" != "0" ]; then
-    reg_args="--vts_pred_reg --vts_pred_reg_weight $lam --vts_pred_source $SOURCE --vts_pred_periodicity $P --vts_pred_render $VTS_RENDER --vts_pred_ckpt_dir $CKPT_DIR"
-    if [ "$SOURCE" = "timesfm_mv" ]; then tag="tfmmvreg${lam}"
+    if [ "$SOURCE" = "visionts_long" ]; then
+      local tT tP; IFS='|' read -r tT tP <<< "$(get_long "$ds")" || return 1
+      P="$tP"
+      reg_args="--vts_pred_reg --vts_pred_reg_weight $lam --vts_pred_source visionts_long --vts_teacher_seq_len $tT --vts_pred_periodicity $P"
+    else
+      reg_args="--vts_pred_reg --vts_pred_reg_weight $lam --vts_pred_source $SOURCE --vts_pred_periodicity $P --vts_pred_render $VTS_RENDER --vts_pred_ckpt_dir $CKPT_DIR"
+    fi
+    if [ "$SOURCE" = "visionts_long" ]; then tag="vtsreglong${lam}"
+    elif [ "$SOURCE" = "timesfm_mv" ]; then tag="tfmmvreg${lam}"
     elif [ "$SOURCE" = "timesfm" ]; then tag="tfmreg${lam}"
     elif [ "$VTS_RENDER" = "ci" ]; then tag="vtsregci${lam}"
     else tag="vtsreg${lam}"; fi
