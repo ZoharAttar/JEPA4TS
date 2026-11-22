@@ -31,21 +31,32 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # ablation: same regularizer, a TS foundation model instead of a visual one.
         # 'timesfm' = univariate (CI) TimesFM forecasts; 'timesfm_mv' = joint
         # multivariate TimesFM forecasts (all channels in one context).
+        # 'visionts_long' = precomputed VisionTS++ MV forecasts from a LONGER teacher
+        # look-back (--vts_teacher_seq_len) ending at the same step as the student's
+        # 96-step window; windows without enough history have no entry and are masked.
         self.vts_source = getattr(args, 'vts_pred_source', 'visionts')
-        if self.vts_reg and self.vts_source.startswith('timesfm'):
+        if self.vts_reg and (self.vts_source.startswith('timesfm') or self.vts_source == 'visionts_long'):
             import os as _os
             stem = _os.path.splitext(_os.path.basename(args.data_path))[0]
-            prefix = "timesfm_mv_forecast" if self.vts_source == 'timesfm_mv' else "timesfm_forecast"
-            mode = 'mv' if self.vts_source == 'timesfm_mv' else 'ci'
-            self.tfm_cache = _os.path.join(args.root_path, f"{prefix}_{stem}_{args.pred_len}")
-            if not _os.path.isdir(self.tfm_cache):
-                raise ValueError(f"TimesFM cache not found: {self.tfm_cache}\n"
-                                 f"   Run utils/precompute_timesfm_forecast.py --dataset {stem} "
-                                 f"--pred_len {args.pred_len} --mode {mode} first!")
+            if self.vts_source == 'visionts_long':
+                T = getattr(args, 'vts_teacher_seq_len', 0)
+                P = getattr(args, 'vts_pred_periodicity', 24)
+                self.fc_cache = _os.path.join(
+                    args.root_path, f"visionts_long_forecast_{stem}_T{T}_P{P}_{args.pred_len}")
+                hint = (f"utils/precompute_visionts_long_forecast.py --dataset {stem} "
+                        f"--pred_len {args.pred_len} --teacher_seq_len {T} --periodicity {P}")
+            else:
+                prefix = "timesfm_mv_forecast" if self.vts_source == 'timesfm_mv' else "timesfm_forecast"
+                mode = 'mv' if self.vts_source == 'timesfm_mv' else 'ci'
+                self.fc_cache = _os.path.join(args.root_path, f"{prefix}_{stem}_{args.pred_len}")
+                hint = (f"utils/precompute_timesfm_forecast.py --dataset {stem} "
+                        f"--pred_len {args.pred_len} --mode {mode}")
+            if not _os.path.isdir(self.fc_cache):
+                raise ValueError(f"Teacher forecast cache not found: {self.fc_cache}\n   Run {hint} first!")
             self.vts_reg_weight = getattr(args, 'vts_pred_reg_weight', 1.0)
-            n = len([f for f in os.listdir(self.tfm_cache) if f.endswith('.npy')])
+            n = len([f for f in os.listdir(self.fc_cache) if f.endswith('.npy')])
             print(f"[pred-reg] source={self.vts_source}, weight={self.vts_reg_weight}, "
-                  f"cache={self.tfm_cache} ({n} forecasts)")
+                  f"cache={self.fc_cache} ({n} forecasts)")
         elif self.vts_reg:
             from visionts import VisionTSpp
             arch = getattr(args, 'vts_pred_arch', 'mae_base')
@@ -79,7 +90,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         Forced to fp32 (autocast disabled) for a stable teacher target.
         """
         if self.vts_source.startswith('timesfm'):
-            return self._timesfm_cached(batch_x, f_dim)
+            return self._cached_forecast(batch_x, f_dim)[0]
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
             x = batch_x.float()
             if self.vts_render == 'ci':
@@ -122,25 +133,49 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         y = y.reshape(B, n_chunks, P, G).permute(0, 2, 1, 3).reshape(B, P, n_chunks * G)
         return y[..., :N]
 
-    def _timesfm_cached(self, batch_x, f_dim):
-        """Load precomputed TimesFM forecast target by input-window hash.
+    def _cached_forecast(self, batch_x, f_dim, allow_missing=False):
+        """Load precomputed teacher forecasts (TimesFM / long-context VisionTS++) by
+        the md5 hash of the student's input window.
 
-        batch_x: [B, seq_len, N] -> [B, pred_len, N'] detached. Same md5 hashing as
-        the precompute (utils/precompute_timesfm_forecast.py).
+        batch_x: [B, seq_len, N] -> (y [B, pred_len, N'] detached, mask [B] float).
+        allow_missing=False raises on a missing entry; True returns zeros there with
+        mask 0 (used by 'visionts_long', whose earliest windows have no teacher).
         """
         import hashlib
         x = batch_x.detach().cpu().numpy().astype(np.float32)   # [B, L, N]
-        outs = []
+        outs, mask = [], []
+        shape = None
         for i in range(x.shape[0]):
             h = hashlib.md5(x[i].astype(np.float32).tobytes()).hexdigest()[:16]
-            path = os.path.join(self.tfm_cache, f"{h}.npy")
-            if not os.path.exists(path):
+            path = os.path.join(self.fc_cache, f"{h}.npy")
+            if os.path.exists(path):
+                f = torch.from_numpy(np.load(path))                # [pred_len, N]
+                shape = f.shape
+                outs.append(f); mask.append(1.0)
+            elif allow_missing:
+                outs.append(None); mask.append(0.0)
+            else:
                 raise FileNotFoundError(
-                    f"TimesFM forecast not found: {path}\n"
-                    f"Run utils/precompute_timesfm_forecast.py for this dataset/pred_len.")
-            outs.append(torch.from_numpy(np.load(path)))        # [pred_len, N]
-        y = torch.stack(outs, dim=0).to(batch_x.device).float()  # [B, pred_len, N]
-        return y[:, -self.args.pred_len:, f_dim:].detach()
+                    f"Teacher forecast not found: {path}\n"
+                    f"Run the matching precompute script for this dataset/pred_len.")
+        if shape is None:                                          # whole batch masked
+            shape = (self.args.pred_len, x.shape[2])
+        outs = [o if o is not None else torch.zeros(shape) for o in outs]
+        y = torch.stack(outs, dim=0).to(batch_x.device).float()   # [B, pred_len, N]
+        m = torch.tensor(mask, device=batch_x.device)
+        return y[:, -self.args.pred_len:, f_dim:].detach(), m
+
+    def _reg_term(self, outputs, batch_x, f_dim):
+        """Prediction-regularizer MSE between the student forecast and the teacher's.
+        For 'visionts_long', samples without a teacher forecast are masked out."""
+        if self.vts_source == 'visionts_long':
+            y, m = self._cached_forecast(batch_x, f_dim, allow_missing=True)
+            if m.sum() == 0:
+                return outputs.sum() * 0.0
+            m = m.view(-1, 1, 1).to(outputs.dtype)
+            sq = (outputs - y.to(outputs.dtype)) ** 2 * m
+            return sq.sum() / (m.sum() * outputs.shape[1] * outputs.shape[2])
+        return nn.functional.mse_loss(outputs, self._vts_forecast(batch_x, f_dim).to(outputs.dtype))
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
@@ -249,8 +284,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
                         if self.vts_reg:
-                            vts_pred = self._vts_forecast(batch_x, f_dim)
-                            loss = loss + self.vts_reg_weight * criterion(outputs, vts_pred)
+                            loss = loss + self.vts_reg_weight * self._reg_term(outputs, batch_x, f_dim)
                         train_loss.append(loss.item())
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
@@ -260,8 +294,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
                     if self.vts_reg:
-                        vts_pred = self._vts_forecast(batch_x, f_dim)
-                        loss = loss + self.vts_reg_weight * criterion(outputs, vts_pred)
+                        loss = loss + self.vts_reg_weight * self._reg_term(outputs, batch_x, f_dim)
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
